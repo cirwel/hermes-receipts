@@ -1,0 +1,117 @@
+"""Receipt ledger and per-repository settings in the plugin's own data directory."""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+import time
+from contextlib import closing
+from pathlib import Path
+
+PLUGIN_NAME = "receipts"
+MAX_RECEIPTS_PER_REPO = 500
+_LOCK = threading.Lock()
+
+_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS checks (
+        root TEXT PRIMARY KEY,
+        command TEXT NOT NULL,
+        set_at REAL NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at REAL NOT NULL,
+        root TEXT NOT NULL,
+        command TEXT NOT NULL,
+        tree TEXT NOT NULL,
+        head_tree TEXT NOT NULL,
+        overlay_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        exit_code INTEGER,
+        duration_ms INTEGER,
+        output_sha256 TEXT NOT NULL,
+        output_chars INTEGER NOT NULL,
+        session_id TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS receipts_root_tree ON receipts (root, tree, id)",
+)
+
+
+def data_dir() -> Path:
+    try:
+        from plugins.plugin_storage import plugin_data_dir  # Hermes >= 0.22
+        return plugin_data_dir(PLUGIN_NAME)
+    except Exception:
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        path = Path(home) / "plugin-data" / PLUGIN_NAME
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+
+class Store:
+    def __init__(self, path: Path | None = None):
+        self.path = path or (data_dir() / "receipts.db")
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        for ddl in _SCHEMA:
+            conn.execute(ddl)
+        return conn
+
+    # ── settings ────────────────────────────────────────────────────────────
+    def check_for(self, root: str) -> str | None:
+        with _LOCK, closing(self._connect()) as conn, conn:
+            row = conn.execute("SELECT command FROM checks WHERE root = ?", (root,)).fetchone()
+        return row["command"] if row else None
+
+    def set_check(self, root: str, command: str | None) -> None:
+        with _LOCK, closing(self._connect()) as conn, conn:
+            if command:
+                conn.execute("INSERT INTO checks (root, command, set_at) VALUES (?, ?, ?) "
+                             "ON CONFLICT(root) DO UPDATE SET command = excluded.command, set_at = excluded.set_at",
+                             (root, command, time.time()))
+            else:
+                conn.execute("DELETE FROM checks WHERE root = ?", (root,))
+
+    def configured_roots(self) -> list[tuple[str, str]]:
+        with _LOCK, closing(self._connect()) as conn, conn:
+            return [(r["root"], r["command"]) for r in conn.execute("SELECT root, command FROM checks ORDER BY root")]
+
+    # ── receipts ────────────────────────────────────────────────────────────
+    def add(self, *, root: str, command: str, tree: str, head_tree: str, overlay: dict, status: str,
+            exit_code: int | None, duration_ms: int | None, output_sha256: str, output_chars: int,
+            session_id: str) -> int:
+        with _LOCK, closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                "INSERT INTO receipts (created_at, root, command, tree, head_tree, overlay_json, status, exit_code,"
+                " duration_ms, output_sha256, output_chars, session_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), root, command, tree, head_tree, json.dumps(overlay, sort_keys=True), status,
+                 exit_code, duration_ms, output_sha256, output_chars, session_id or ""))
+            conn.execute("DELETE FROM receipts WHERE root = ? AND id NOT IN "
+                         "(SELECT id FROM receipts WHERE root = ? ORDER BY id DESC LIMIT ?)",
+                         (root, root, MAX_RECEIPTS_PER_REPO))
+            return int(cur.lastrowid)
+
+    def latest_for_tree(self, root: str, tree: str, command: str) -> sqlite3.Row | None:
+        """Most recent conclusive receipt (passed or failed) for exactly this content and check."""
+        with _LOCK, closing(self._connect()) as conn, conn:
+            return conn.execute(
+                "SELECT * FROM receipts WHERE root = ? AND tree = ? AND command = ? AND status IN ('passed','failed')"
+                " ORDER BY id DESC LIMIT 1", (root, tree, command)).fetchone()
+
+    def latest_passing(self, root: str, command: str) -> sqlite3.Row | None:
+        with _LOCK, closing(self._connect()) as conn, conn:
+            return conn.execute(
+                "SELECT * FROM receipts WHERE root = ? AND command = ? AND status = 'passed' ORDER BY id DESC LIMIT 1",
+                (root, command)).fetchone()
+
+    def recent(self, root: str, limit: int = 10) -> list[sqlite3.Row]:
+        with _LOCK, closing(self._connect()) as conn, conn:
+            return list(conn.execute("SELECT * FROM receipts WHERE root = ? ORDER BY id DESC LIMIT ?", (root, limit)))
+
+    def clear(self, root: str) -> int:
+        with _LOCK, closing(self._connect()) as conn, conn:
+            return conn.execute("DELETE FROM receipts WHERE root = ?", (root,)).rowcount

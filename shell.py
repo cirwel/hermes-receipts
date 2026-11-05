@@ -92,6 +92,8 @@ def _git_parts(words: list[str], cwd: str) -> tuple[str, list[str], str]:
             i += 1
         elif opt.startswith("--work-tree="):
             cwd = _resolve(opt.partition("=")[2], cwd)
+        elif opt.startswith("-C") and len(opt) > 2:
+            cwd = _resolve(opt[2:], cwd)
     sub = words[i] if i < len(words) else ""
     return sub, words[i + 1:], cwd
 
@@ -190,6 +192,15 @@ def guarded_actions(command: str, cwd: str, guard_pr: bool = True, _depth: int =
                 and any(w in {"--delete", "-d", "--dry-run", "-n"} for w in segments[0])):
             return [Action("opaque", cwd, text=command)]
     return actions
+
+
+def invocation_cwd(command: str, cwd: str) -> str:
+    """Resolve a static leading cd so callers can find the target's settings."""
+    segments = _split(command)
+    if segments and len(segments) == 2 and len(segments[0]) == 2 \
+            and segments[0][0] == "cd" and _static(segments[0][1]) and "&&" in command:
+        return _resolve(segments[0][1], cwd)
+    return cwd
 
 
 def check_invocation(command: str, check: str, cwd: str) -> str | None:

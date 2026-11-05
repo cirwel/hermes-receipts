@@ -145,7 +145,7 @@ class Receipts:
             return
         root = None
         try:
-            root = gitstate.repo_root(base, deadline)
+            root = gitstate.repo_root(shell.invocation_cwd(command, base), deadline)
             check = self.store.check_for(root) if root else None
             if not check:
                 return

@@ -195,6 +195,8 @@ def fingerprint(root: str, deadline: float) -> Fingerprint:
                        check=False).decode().strip() != "false"
     except GitUnavailable:
         filemode = True
+    symlinks = git(root, "config", "--bool", "core.symlinks", deadline=deadline,
+                   check=False).decode().strip() != "false"
 
     head_entries: dict[str, tuple[str, str, str]] = {}  # path -> (mode, type, oid)
     if head_ct:
@@ -229,7 +231,9 @@ def fingerprint(root: str, deadline: float) -> Fingerprint:
             raise GitUnavailable("hash-object returned an unexpected number of ids")
         for rel, oid in zip(to_hash, oids):
             executable = bool(os.lstat(os.path.join(root, rel)).st_mode & stat.S_IXUSR)
-            if filemode:
+            if not symlinks and index_modes.get(rel) == "120000":
+                mode = "120000"
+            elif filemode:
                 mode = "100755" if executable else "100644"
             else:
                 prev = index_modes.get(rel)

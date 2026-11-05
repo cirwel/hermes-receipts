@@ -99,6 +99,26 @@ class RepoCase(unittest.TestCase):
         (self.root / "link").symlink_to("src/one.txt")
         self.assert_tree()
 
+    def test_symlink_placeholder_uses_git_mode_and_text_conversion(self):
+        link = self.root / "link.txt"
+        link.symlink_to("src/one.txt")
+        self.commit()
+        self.git("config", "core.symlinks", "false")
+        link.unlink()
+        link.write_bytes(b"new-target\r\n")
+        self.write(".gitattributes", "*.txt text eol=lf\n")
+        self.assert_tree()
+
+    def test_cd_from_outside_repository_records_receipt(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        self.pre(f"cd {self.root} && python3 -m unittest", workdir=str(self.root.parent))
+        self.service.post_tool_call("terminal", "call", {"exit_code": 0})
+        self.assertEqual(self.store.recent(str(self.root))[0]["status"], "passed")
+
+    def test_joined_git_directory_cannot_skip_gate(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        self.assertEqual(self.pre(f"git -C{self.root} push origin main", workdir=str(self.root.parent))["action"], "block")
+
     def test_names_spaces_newlines_quotes(self):
         for name in ('space name', 'line\nname', '"quoted"', 'é.txt'):
             self.write(name, name)

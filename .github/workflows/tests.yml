@@ -1,12 +1,14 @@
 name: Tests
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
 jobs:
   behavior:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest

@@ -37,7 +37,9 @@ class RepoCase(unittest.TestCase):
         self.store = Store(Path(self.tmp.name) / "receipts.db")
         self.service = receipts.Receipts(self.store)
         self.addCleanup(receipts._pending.clear)
-        self.enterContext(patch.dict(os.environ, {"TERMINAL_ENV": "local"}))
+        environment = patch.dict(os.environ, {"TERMINAL_ENV": "local"})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def git(self, *args, env=None):
         # A fixture commit must not leave detached maintenance racing the

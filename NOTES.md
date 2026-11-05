@@ -15,10 +15,13 @@ The runtime plugin uses documented helpers. Catalog validation warns about
 internal Hermes imports in the integration-demo harness only; README discloses them.
 The default in-process plugin mode and local terminal backend are supported.
 
-Delivery remaining:
-- Bootstrap the public repository, push via the repository-scoped agent App,
-  and run the GitHub CI workflow before declaring the release ready.
-- Submit the SHA-pinned catalog entry. The owner-account exception is pending.
+Delivery:
+- Public source: https://github.com/cirwel/hermes-receipts
+- Release PR and current CI: https://github.com/cirwel/hermes-receipts/pull/1
+  Use its live checks for readiness. The first macOS run found a fixture race
+  from detached Git maintenance; the fixture now disables that maintenance.
+- The owner-account exception is authorized. Catalog submission is held while
+  the operator decides whether to wait for a demo review.
 - Record/publish the demo video and submit the entry form. DEMO.md has a 75-second outline.
 
 The Google-family implementation review returned no review: its command tool was

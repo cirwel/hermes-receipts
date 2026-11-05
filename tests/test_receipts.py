@@ -40,7 +40,10 @@ class RepoCase(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"TERMINAL_ENV": "local"}))
 
     def git(self, *args, env=None):
+        # A fixture commit must not leave detached maintenance racing the
+        # read-only fingerprint assertions on newer Git versions.
         return subprocess.check_output(["git", "-c", "core.hooksPath=" + os.devnull,
+                                        "-c", "maintenance.auto=false", "-c", "gc.auto=0",
                                         "-C", str(self.root), *args], env=env or self.env,
                                        stderr=subprocess.PIPE).decode().strip()
 

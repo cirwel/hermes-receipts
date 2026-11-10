@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,13 @@ sys.modules["receipts"] = receipts
 spec.loader.exec_module(receipts)
 from receipts import gitstate, shell
 from receipts.store import Store
+
+COPROCESS_CHECKS = (
+    "coproc false", "time coproc false", "time -p coproc false",
+    "(coproc false)", "coproc bash -c false", "! ! coproc false",
+    "time ! ! coproc false", "time -- coproc false",
+    "time -p -- coproc false", "( time coproc false )",
+)
 
 
 class RepoCase(unittest.TestCase):
@@ -257,6 +265,85 @@ class RepoCase(unittest.TestCase):
         with patch.dict(os.environ, {"TERMINAL_ENV": "docker"}):
             self.assertIsNone(self.pre("git push origin main"))
 
+    def test_unsupported_check_configuration_preserves_previous_setting(self):
+        unsupported = (
+            "python3 -m unittest && echo done", "python3 -m unittest; true",
+            "python3 -m unittest || true", "python3 -m unittest | tee log",
+            "python3 -m unittest > log", "python3 -m unittest &",
+            "python3 -m unittest\necho done", "cd . && python3 -m unittest",
+            "python3 -m unittest &&", "echo $(date)", "echo `date`", "echo '",
+            "x" * (shell.MAX_COMMAND_CHARS + 1),
+        ) + COPROCESS_CHECKS
+        with patch.object(receipts, "_agent_cwd", return_value=str(self.root)):
+            for previous in (None, "python3 -m unittest"):
+                for command in unsupported:
+                    with self.subTest(previous=previous, command=command[:80]):
+                        self.store.set_check(str(self.root), previous)
+                        message = self.service.command("check " + command)
+                        self.assertIn("cannot earn receipts", message)
+                        self.assertIn("script", message)
+                        self.assertEqual(self.store.check_for(str(self.root)), previous)
+
+    def test_supported_check_configuration_records_and_can_be_disabled(self):
+        with patch.object(receipts, "_agent_cwd", return_value=str(self.root)):
+            message = self.service.command("check python3 -m unittest")
+            self.assertIn("is now", message)
+            self.assertIsNone(self.pre("python3 -m unittest"))
+            self.service.post_tool_call("terminal", "call", {"exit_code": 0})
+            self.assertEqual(self.store.recent(str(self.root))[0]["status"], "passed")
+            self.assertIsNone(self.pre("git push origin main"))
+            self.assertIn("removed", self.service.command("check --off"))
+            self.assertIsNone(self.store.check_for(str(self.root)))
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash coprocess support")
+    def test_coprocess_exit_zero_never_earns_a_passing_receipt(self):
+        # Older settings can contain these commands. Bash returns zero for
+        # starting a coprocess even though the actual check fails asynchronously.
+        if subprocess.run(["bash", "-c", "help coproc"], capture_output=True, timeout=5).returncode:
+            self.skipTest("requires Bash with coprocess support (4.0+)")
+        for command in COPROCESS_CHECKS:
+            with self.subTest(command=command):
+                self.store.set_check(str(self.root), command)
+                self.assertIsNone(self.pre(command))
+                result = subprocess.run(["bash", "-c", command], cwd=self.root,
+                                        env=self.env, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.service.post_tool_call("terminal", "call", {"exit_code": result.returncode})
+                self.assertEqual(self.store.recent(str(self.root)), [])
+                self.assertEqual(self.pre("git push origin main")["action"], "block")
+
+    def test_legacy_unsupported_check_explains_repair_in_status_and_gate(self):
+        self.store.set_check(str(self.root), "python3 -m unittest && echo done")
+        with patch.object(receipts, "_agent_cwd", return_value=str(self.root)):
+            self.assertIn("cannot earn receipts", self.service.command())
+            self.assertIn("/receipts check", self.service.command())
+        blocked = self.pre("git push origin main")
+        self.assertEqual(blocked["action"], "block")
+        self.assertIn("cannot earn receipts", blocked["message"])
+        self.assertIn("/receipts check", blocked["message"])
+
+    def test_multiplex_publish_block_is_explicit_without_reading_repo_state(self):
+        with patch.object(receipts, "_inactive_reason", return_value="multiplexed profiles are not supported in this release"), \
+                patch.object(receipts, "_agent_cwd", side_effect=AssertionError("read cwd")), \
+                patch.object(self.store, "check_for", side_effect=AssertionError("read settings")):
+            for command in ("git push origin main", "gh pr create", "bash -c 'git push origin main'"):
+                with self.subTest(command=command):
+                    blocked = self.pre(command)
+                    self.assertEqual(blocked["action"], "block")
+                    self.assertIn("multiplexed profiles", blocked["message"])
+                    self.assertIn("single-profile Hermes CLI", blocked["message"])
+            self.assertIsNone(self.pre("python3 -m unittest"))
+            self.assertIn("publishing commands are blocked", self.service.command())
+
+    def test_becoming_inactive_discards_pending_check_without_recording(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        self.pre("python3 -m unittest")
+        with patch.object(receipts, "_inactive_reason", return_value="multiplexed profiles are not supported in this release"):
+            self.service.post_tool_call("terminal", "call", {"exit_code": 0, "cwd": str(self.root)})
+        self.assertEqual(self.store.recent(str(self.root)), [])
+        self.assertEqual(self.service._terminal_cwds, {})
+        self.assertEqual(receipts._pending, {})
+
 
 class ShellCase(unittest.TestCase):
     def test_plain_named_push(self):
@@ -268,6 +355,19 @@ class ShellCase(unittest.TestCase):
             self.assertIsNone(shell.check_invocation(command, "pytest", "/repo"))
         self.assertEqual(shell.check_invocation("cd /repo && pytest", "pytest", "/base"), "/repo")
         self.assertIsNone(shell.check_invocation('echo "$CHECK"', "echo '$CHECK'", "/repo"))
+
+    def test_multiline_configured_check_never_records_masked_success(self):
+        check = "false\ntrue"
+        self.assertIsNone(shell.check_invocation(check, check, "/repo"))
+
+    def test_control_constructs_are_not_foreground_check_commands(self):
+        for check in COPROCESS_CHECKS + ("! false", "time ! false"):
+            with self.subTest(check=check):
+                self.assertIsNone(shell.check_invocation(check, check, "/repo"))
+                self.assertIsNone(shell.check_invocation("cd /repo && " + check, check, "/base"))
+        for check in ("echo coproc", 'python3 -c "print(\'coproc\')"', "time python3 -m unittest"):
+            with self.subTest(check=check):
+                self.assertEqual(shell.check_invocation(check, check, "/repo"), "/repo")
 
     def test_dynamic_home_not_static(self):
         self.assertFalse(shell._static("~/$TARGET"))

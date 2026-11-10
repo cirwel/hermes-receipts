@@ -213,7 +213,7 @@ def check_invocation(command: str, check: str, cwd: str) -> str | None:
         return None
     if command.count("&&") > (1 if len(segments) == 2 else 0):
         return None
-    if any(op in command for op in ("|", ";", "||", ">", "<", "&\n")) or command.rstrip().endswith("&"):
+    if any(op in command for op in ("|", ";", "||", ">", "<", "\n")) or command.rstrip().endswith("&"):
         return None
     if len(segments) == 2:
         first = segments[0]
@@ -222,6 +222,12 @@ def check_invocation(command: str, check: str, cwd: str) -> str | None:
         cwd = _resolve(first[1], cwd)
         segments = segments[1:]
     if len(segments) != 1:
+        return None
+    words = _unwrap(segments[0])
+    if words and words[0] in {"coproc", "!"}:
+        # coproc reports launch success, not the asynchronous check's status;
+        # shell negation can hide it again after wrappers such as `time`.
+        # Inspect command position only: `echo coproc` is an ordinary command.
         return None
     # shlex drops quoting: "$VAR" and '$VAR' must not certify each other.
     if len(_split(command) or []) == 2:

@@ -7,6 +7,7 @@ pre_tool_call (terminal tool only):
   * `hermes receipts check|clear` from the agent is refused (configuration is the user's).
 post_tool_call: records the receipt (passed / failed / changed-during-run).
 Returns only `block` or nothing; never `approve`. Inactive on non-local terminal backends.
+Multiplexed profiles cannot earn receipts; recognized publishing commands are explicitly blocked.
 """
 
 from __future__ import annotations
@@ -21,7 +22,20 @@ if __package__:
     from .store import Store
 
 BUDGET_S = 8.0          # well under the 30 s fail-closed hook deadline
+_MULTIPLEX_UNSUPPORTED = "multiplexed profiles are not supported in this release"
 _pending: dict[str, tuple[str, str, object, float]] = {}   # tool_call_id -> (root, cmd, fp, t0)
+
+
+def _check_error(command: str, root: str) -> str | None:
+    # Use the recording recognizer, so setup cannot accept a check that the
+    # hooks will never recognize. Do not attempt to execute or rewrite it.
+    if shell.check_invocation(command, command, root) == root:
+        return None
+    return ("this check cannot earn receipts. Set one foreground command to run in the repository root "
+            "with `/receipts check <command>`. Pipes, redirects, chains, background jobs (including coproc), "
+            "shell negation and unsupported "
+            "shell syntax are not accepted. Put multi-step checks in a script that returns a nonzero "
+            "exit code on failure, then configure that script as the check.")
 
 
 def _agent_cwd() -> str:
@@ -36,7 +50,7 @@ def _inactive_reason() -> str:
     try:
         from agent.secret_scope import is_multiplex_active
         if is_multiplex_active():
-            return "multiplexed profiles are not supported in this release"
+            return _MULTIPLEX_UNSUPPORTED
         from hermes_cli.config import load_config
         config = load_config() or {}
         if config.get("plugins", {}).get("isolation") == "host":
@@ -48,6 +62,15 @@ def _inactive_reason() -> str:
     return "" if backend == "local" else f"terminal backend is `{backend}`; receipts supports `local` only"
 
 
+def _inactive_message(reason: str) -> str:
+    message = f"receipts is inactive: {reason}."
+    if reason == _MULTIPLEX_UNSUPPORTED:
+        message += (" Recognized publishing commands are blocked while this plugin is enabled, even in "
+                    "unconfigured repositories. Use a standalone, single-profile Hermes CLI session with "
+                    "the local terminal and in-process plugins; run /receipts there before retrying.")
+    return message
+
+
 class Receipts:
     def __init__(self, store: "Store | None" = None):
         self.store = store or Store()
@@ -57,11 +80,17 @@ class Receipts:
     # ── gate ───────────────────────────────────────────────────────────────
     def pre_tool_call(self, tool_name: str = "", args: dict | None = None, tool_call_id: str = "",
                       task_id: str = "", session_id: str = "", **_):
-        if tool_name != "terminal" or _inactive_reason():
+        if tool_name != "terminal":
             return None
         args = args if isinstance(args, dict) else {}
         command = args.get("command") or ""
         if not isinstance(command, str) or not command.strip():
+            return None
+        if inactive := _inactive_reason():
+            # Do not inspect a repository or read profile-bound state in an
+            # unsupported multiplex context. A silent no-op looks like approval.
+            if inactive == _MULTIPLEX_UNSUPPORTED and shell.guarded_actions(command, os.curdir):
+                return {"action": "block", "message": f"[receipts] Blocked: {_inactive_message(inactive)}"}
             return None
         deadline = time.monotonic() + BUDGET_S
         base = self._terminal_cwds.get(task_id or session_id) or _agent_cwd()
@@ -92,6 +121,8 @@ class Receipts:
         check = self.store.check_for(root)
         if not check:
             return None                       # unconfigured repositories are never blocked
+        if error := _check_error(check, root):
+            return f"[receipts] Blocked: {error}"
         if action.kind == "push" and gitstate.git(root, "config", "--bool", "push.followTags",
                                                   deadline=deadline, check=False).strip() == b"true":
             return "[receipts] Blocked: push.followTags may publish additional commits; disable it or push manually."
@@ -161,6 +192,10 @@ class Receipts:
 
     def post_tool_call(self, tool_name: str = "", tool_call_id: str = "", result=None, session_id: str = "",
                        duration_ms=None, args: dict | None = None, task_id: str = "", **_):
+        if _inactive_reason():
+            if tool_call_id:
+                _pending.pop(f"{session_id}\0{tool_call_id}", None)
+            return None
         try:
             data = json.loads(result) if isinstance(result, str) else (result or {})
         except (ValueError, TypeError):
@@ -196,15 +231,17 @@ class Receipts:
         words = raw_args.split(None, 1)
         sub = words[0] if words else "status"
         rest = words[1].strip() if len(words) > 1 else ""
+        if inactive := _inactive_reason():
+            return _inactive_message(inactive)
         deadline = time.monotonic() + BUDGET_S
         root = gitstate.repo_root(_agent_cwd(), deadline)
-        if inactive := _inactive_reason():
-            return f"receipts is inactive: {inactive}."
         if not root:
             return "receipts: the current directory is not inside a git repository."
         if sub == "check":
             if not rest:
                 return "usage: /receipts check <command>   (or: /receipts check --off)"
+            if rest != "--off" and (error := _check_error(rest, root)):
+                return f"receipts: {error} The configured check was not changed."
             self.store.set_check(root, None if rest == "--off" else rest)
             if rest == "--off":
                 return f"receipts: removed the check for {root}."
@@ -219,6 +256,8 @@ class Receipts:
         check = self.store.check_for(root)
         if not check:
             return f"receipts: no check configured for {root}. Set one with /receipts check <command>."
+        if error := _check_error(check, root):
+            return f"receipts: {error}"
         try:
             fp = gitstate.fingerprint(root, deadline)
         except gitstate.GitUnavailable as exc:

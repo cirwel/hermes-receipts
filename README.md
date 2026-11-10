@@ -14,7 +14,10 @@ doesn't create a receipt. No model call or additional model tool is needed.
 ## Try it
 
 Requires Git, Python 3.10+, and Hermes with `pre_tool_call` and `post_tool_call`
-plugin hooks (manifest minimum: 0.22.0; runtime demo verified with 0.22.5).
+plugin hooks (manifest minimum: 0.22.0; runtime demo verified with 0.22.5 and
+0.23.0). Use a standalone single-profile Hermes CLI session with the local
+terminal and in-process plugins. See [compatibility](COMPATIBILITY.md) for the
+multiplex limitation and exact test scope.
 
 Install from this checkout:
 
@@ -58,7 +61,20 @@ again and retry. A failed run for the same content supersedes an earlier pass.
 
 Run the check in the repository root, as a foreground terminal command on its
 own. Pipes, redirects, chained commands and background jobs do not earn receipts.
-Unconfigured repositories are unaffected.
+Shell control forms such as `coproc` and `!` are unsupported, including after
+wrappers such as `time`. Commands such as `echo coproc` remain accepted.
+Setup rejects command forms the recorder cannot recognize and keeps the previous
+setting unchanged. For multiple steps, put them in a script that returns a nonzero
+exit code when any required step fails and waits for all required work to finish,
+then configure the script itself:
+
+```text
+/receipts check python3 check.py
+```
+
+Previously saved unsupported checks show repair guidance in `/receipts` and
+the push-block message. Unconfigured repositories are unaffected in supported
+single-profile mode.
 
 ## What is verified
 
@@ -80,7 +96,16 @@ The message explains how to use a supported command.
 
 This release covers the **local terminal backend** and Hermes's default
 `plugins.isolation: in_process` mode. Remote/container terminal backends,
-multiplexed profiles, and the separate plugin-host mode are inactive.
+and the separate plugin-host mode are inactive.
+
+**Multiplexed profiles are not supported.** When Hermes reports a multiplexed
+context, Receipts does not record checks or inspect host repositories. While the
+plugin is enabled, recognized publishing commands are blocked with an explicit
+inactive-mode explanation, including in unconfigured repositories. Ordinary
+terminal commands continue. Use a standalone single-profile CLI session to earn
+and use receipts. Hermes 0.23's gateway defaults to multiplexing, though its
+single-profile optimization can leave multiplex mode off; do not assume that
+every Hermes session has the same behavior.
 
 Receipts is a workflow gate, not a security boundary. Shell recognition is
 deliberately bounded; aliases, custom publishing scripts, other tools and a user's
@@ -113,6 +138,7 @@ Run `demo.py` with the Python interpreter from your Hermes installation:
 
 ```sh
 /path/to/hermes/venv/bin/python demo.py
+/path/to/hermes/venv/bin/python demo_multiplex.py
 ```
 
 The demo loads the plugin through Hermes discovery and exercises its hook
@@ -132,5 +158,9 @@ runtime uses documented helpers and hook registration APIs.
 It uses no LLM and leaves your installed plugins and repository configuration
 unchanged. The automated suite compares fingerprints against Git's actual tree
 IDs and checks that fingerprinting leaves the real index and object store intact.
+`demo_multiplex.py` checks the explicit unsupported-mode block through Hermes's
+real discovery, hook dispatch and multiplex APIs. It executes only an ordinary
+local terminal command and never executes a push or PR command. This is not a
+full gateway or concurrent-profile compatibility test.
 
 Apache-2.0. Built by Kenny Wang with AI-assisted implementation and review.

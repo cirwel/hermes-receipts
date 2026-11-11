@@ -93,8 +93,10 @@ class Repo:
         if not common:
             return None
         key = os.path.realpath(common)
-        top = ask("--show-toplevel")
-        return cls(os.path.realpath(top) if top else key, key)
+        # The gate only reads commits and trees, so it runs git in the repository's own
+        # directory. The working directory is not trusted here: with GIT_DIR set, git
+        # reports the caller's cwd as the worktree even when it is an unrelated folder.
+        return cls(key, key)
 
 
 def _say(text: str) -> None:
@@ -269,9 +271,15 @@ def cmd_hook(store, repo: Repo, args) -> int:
         return 2
     revs: list[str] = []
     for line in sys.stdin.read().splitlines():
-        parts = line.split()
-        if len(parts) != 4:
+        if not line.strip():
             continue
+        # <local ref> <local sha> <remote ref> <remote sha>; the local ref may be a revision
+        # expression containing spaces, so split from the right. A line that does not fit
+        # is content this gate cannot see, which must not pass as approval.
+        parts = line.rsplit(None, 3)
+        if len(parts) != 4:
+            _say("[receipts] Blocked `git push`: could not read what is being pushed.")
+            return 1
         local_sha = parts[1]
         if set(local_sha) == {"0"}:           # deleting a remote ref publishes no content
             continue

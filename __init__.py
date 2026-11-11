@@ -40,6 +40,10 @@ def _check_error(command: str, root: str) -> str | None:
             "exit code on failure, then configure that script as the check.")
 
 
+def _text(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def _agent_cwd() -> str:
     try:
         from agent.runtime_cwd import resolve_agent_cwd
@@ -98,6 +102,7 @@ class Receipts:
                       task_id: str = "", session_id: str = "", **_):
         if tool_name != "terminal":
             return None
+        task_id, session_id = _text(task_id), _text(session_id)
         args = args if isinstance(args, dict) else {}
         command = args.get("command") or ""
         if not isinstance(command, str) or not command.strip():
@@ -211,6 +216,7 @@ class Receipts:
 
     def post_tool_call(self, tool_name: str = "", tool_call_id: str = "", result=None, session_id: str = "",
                        duration_ms=None, args: dict | None = None, task_id: str = "", **_):
+        task_id, session_id = _text(task_id), _text(session_id)
         if _inactive_reason():
             if tool_call_id:
                 _pending.pop(f"{session_id}\0{tool_call_id}", None)

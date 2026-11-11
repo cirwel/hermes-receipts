@@ -66,25 +66,30 @@ class Store:
         self._upgraded = False
         self._upgrade_after = 0.0
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, writing: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5)
         conn.row_factory = sqlite3.Row
         for ddl in _SCHEMA:
             conn.execute(ddl)
-        self._upgrade(conn)
+        self._upgrade(conn, force=writing)
         return conn
 
-    def _upgrade(self, conn: sqlite3.Connection) -> None:
+    def _upgrade(self, conn: sqlite3.Connection, force: bool = False) -> None:
         """Add the 0.2 table and columns. Best effort: a ledger that cannot be written
-        right now (read-only, locked by another process) keeps working as a 0.1 ledger."""
-        if self._upgraded or time.monotonic() < self._upgrade_after:
+        right now (read-only, locked by another process) keeps working as a 0.1 ledger.
+
+        Reads try briefly and then leave it alone for a while, so the gate is never held
+        up. A write (``force``) always tries, and waits as long as the write itself would.
+        """
+        if self._upgraded or (not force and time.monotonic() < self._upgrade_after):
             return
         try:
             have = {row["name"] for row in conn.execute("PRAGMA table_info(receipts)")}
             missing = [(n, ddl) for n, ddl in _ADDED_COLUMNS if n not in have]
             has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
             if missing or not has_meta:
-                conn.execute("PRAGMA busy_timeout = 250")     # never hold the gate up for an upgrade
+                if not force:
+                    conn.execute("PRAGMA busy_timeout = 250")
                 try:
                     with conn:
                         conn.execute(_META)
@@ -98,8 +103,11 @@ class Store:
 
     # ── identity ────────────────────────────────────────────────────────────
     def issuer_id(self) -> str:
-        """The id this ledger issues receipts under: minted once, then stable."""
-        with _LOCK, closing(self._connect()) as conn, conn:
+        """The id this ledger issues receipts under: minted once, then stable.
+        Empty when the ledger could not be upgraded to hold one."""
+        with _LOCK, closing(self._connect(writing=True)) as conn, conn:
+            if not self._upgraded:
+                return ""
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('issuer', ?)", (str(uuid.uuid4()),))
             return conn.execute("SELECT value FROM meta WHERE key = 'issuer'").fetchone()["value"]
 
@@ -126,13 +134,16 @@ class Store:
     def add(self, *, root: str, command: str, tree: str, head_tree: str, overlay: dict, status: str,
             exit_code: int | None, duration_ms: int | None, output_sha256: str, output_chars: int,
             session_id: str, model: str = "", issuer: str = "") -> int:
-        with _LOCK, closing(self._connect()) as conn, conn:
-            cur = conn.execute(
-                "INSERT INTO receipts (created_at, root, command, tree, head_tree, overlay_json, status, exit_code,"
-                " duration_ms, output_sha256, output_chars, session_id, model, issuer)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (time.time(), root, command, tree, head_tree, json.dumps(overlay, sort_keys=True), status,
-                 exit_code, duration_ms, output_sha256, output_chars, session_id or "", model or "", issuer or ""))
+        columns = ["created_at", "root", "command", "tree", "head_tree", "overlay_json", "status", "exit_code",
+                   "duration_ms", "output_sha256", "output_chars", "session_id"]
+        values = [time.time(), root, command, tree, head_tree, json.dumps(overlay, sort_keys=True), status,
+                  exit_code, duration_ms, output_sha256, output_chars, session_id or ""]
+        with _LOCK, closing(self._connect(writing=True)) as conn, conn:
+            if self._upgraded:                # a ledger still in the 0.1 layout keeps the receipt itself
+                columns += ["model", "issuer"]
+                values += [model or "", issuer or ""]
+            cur = conn.execute(f"INSERT INTO receipts ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                               values)
             conn.execute("DELETE FROM receipts WHERE root = ? AND id NOT IN "
                          "(SELECT id FROM receipts WHERE root = ? ORDER BY id DESC LIMIT ?)",
                          (root, root, MAX_RECEIPTS_PER_REPO))

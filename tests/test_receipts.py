@@ -129,6 +129,70 @@ class RepoCase(unittest.TestCase):
             self.service.pre_llm_call(session_id=f"s{i}", model="m")
         self.assertEqual(len(self.service._models), receipts.MAX_TRACKED_SESSIONS)
         self.assertIn(f"s{receipts.MAX_TRACKED_SESSIONS + 19}", self.service._models)
+        oldest = next(iter(self.service._models))
+        self.service.pre_llm_call(session_id=oldest, model="m2")          # seen again: no longer first out
+        self.service.pre_llm_call(session_id="one-more", model="m")
+        self.assertEqual(self.service._models[oldest], "m2")
+
+    def test_odd_session_ids_never_raise(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        args = {"command": "python3 -m unittest", "workdir": str(self.root)}
+        self.assertIsNone(self.service.pre_llm_call(session_id={"a": 1}, model="m"))
+        self.assertIsNone(self.service.pre_tool_call("terminal", args, "c", task_id="t", session_id={"a": 1}))
+
+    def old_ledger(self, name="old.db"):
+        import sqlite3
+        path = Path(self.tmp.name) / name
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE checks (root TEXT PRIMARY KEY, command TEXT NOT NULL, set_at REAL NOT NULL)""")
+        conn.execute("""CREATE TABLE receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+            root TEXT NOT NULL, command TEXT NOT NULL, tree TEXT NOT NULL, head_tree TEXT NOT NULL,
+            overlay_json TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, duration_ms INTEGER,
+            output_sha256 TEXT NOT NULL, output_chars INTEGER NOT NULL, session_id TEXT NOT NULL)""")
+        conn.execute("CREATE INDEX receipts_root_tree ON receipts (root, tree, id)")
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        conn.execute("INSERT INTO checks VALUES (?, 'python3 -m unittest', 1)", (str(self.root),))
+        conn.execute("INSERT INTO receipts (created_at, root, command, tree, head_tree, overlay_json, status,"
+                     " exit_code, duration_ms, output_sha256, output_chars, session_id)"
+                     " VALUES (1, ?, 'python3 -m unittest', ?, ?, '{}', 'passed', 0, 1, 'h', 1, '')",
+                     (str(self.root), tree, tree))
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_unwritable_0_1_ledger_still_gates_exactly_as_before(self):
+        path = self.old_ledger()
+        os.chmod(path, 0o444)
+        os.chmod(path.parent, 0o555)
+        self.addCleanup(os.chmod, path.parent, 0o755)
+        service = receipts.Receipts(Store(path))
+        push = {"command": "git push origin main", "workdir": str(self.root)}
+        self.assertIsNone(service.pre_tool_call("terminal", push, "p1"))           # the old pass still counts
+        with patch.object(receipts, "_agent_cwd", return_value=str(self.root)):
+            status = service.command()
+            self.assertIn("receipt: PASSED", status)
+            self.assertIn("model not recorded · issuer not recorded", status)
+            self.assertIn("model:    not recorded", service.command("show"))
+            self.assertIn("passed", service.command("log"))
+        self.write("top.txt", "changed\n")
+        self.commit()
+        self.assertEqual(service.pre_tool_call("terminal", push, "p2")["action"], "block")
+        self.assertIn("no passing run", service.pre_tool_call("terminal", push, "p3")["message"])
+
+    def test_ledger_locked_by_another_writer_does_not_stall_or_block_the_gate(self):
+        import sqlite3
+        path = self.old_ledger("locked.db")
+        other = sqlite3.connect(path)
+        other.execute("BEGIN IMMEDIATE")
+        self.addCleanup(other.close)
+        service = receipts.Receipts(Store(path))
+        started = time.monotonic()
+        self.assertIsNone(service.pre_tool_call("terminal", {"command": "git push origin main",
+                                                             "workdir": str(self.root)}, "p1"))
+        self.assertLess(time.monotonic() - started, 3)
+        other.rollback()
+        service.store._upgrade_after = 0.0
+        self.assertEqual(len(service.store.issuer_id()), 36)                       # upgraded once writable
 
     def test_show_and_status_name_who_checked(self):
         self.service.pre_llm_call(session_id="s1", model="hermes-test-model")
@@ -160,6 +224,7 @@ class RepoCase(unittest.TestCase):
         conn.close()
         store = Store(path)
         self.assertEqual(store.latest_for_tree("r", "t", "c")["model"], "")
+        self.assertEqual(store.issuer_id(), Store(path).issuer_id())
         store.add(root="r", command="c", tree="t2", head_tree="t2", overlay={}, status="passed", exit_code=0,
                   duration_ms=1, output_sha256="h", output_chars=1, session_id="s", model="m", issuer="i")
         self.assertEqual(store.latest_for_tree("r", "t2", "c")["model"], "m")

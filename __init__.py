@@ -20,7 +20,7 @@ import time
 
 if __package__:
     from . import gitstate, shell
-    from .store import Store
+    from .store import Store, field
 
 BUDGET_S = 8.0          # well under the 30 s fail-closed hook deadline
 _MULTIPLEX_UNSUPPORTED = "multiplexed profiles are not supported in this release"
@@ -84,7 +84,7 @@ class Receipts:
     def pre_llm_call(self, session_id: str = "", model: str = "", **_):
         """Remember which model is driving a session. Observes only; never returns a directive."""
         try:
-            if isinstance(model, str) and model.strip() and not _inactive_reason():
+            if isinstance(model, str) and model.strip() and isinstance(session_id, str) and not _inactive_reason():
                 self._models.pop(session_id or "", None)
                 self._models[session_id or ""] = " ".join(model.split())[:120]
                 while len(self._models) > MAX_TRACKED_SESSIONS:
@@ -128,7 +128,7 @@ class Receipts:
 
         if not args.get("background"):
             self._maybe_start_receipt(command, base, f"{session_id}\0{tool_call_id}" if tool_call_id else "", deadline,
-                                      self._models.get(session_id or "", ""))
+                                      self._models.get(session_id or "", "") if isinstance(session_id, str) else "")
         return None
 
     def _gate(self, action, deadline: float) -> str | None:
@@ -271,7 +271,7 @@ class Receipts:
             rows = self.store.recent(root)
             return "\n".join(f"#{r['id']}  {time.strftime('%H:%M:%S', time.localtime(r['created_at']))}  "
                              f"{r['status']:<8} exit={r['exit_code']}  tree {r['tree'][:10]}  `{r['command']}`"
-                             f"{'  model ' + r['model'] if r['model'] else ''}" for r in rows) \
+                             f"{'  model ' + field(r, 'model') if field(r, 'model') else ''}" for r in rows) \
                 or "receipts: no receipts yet."
         if sub == "show":
             return self._show(root, rest, deadline)
@@ -290,7 +290,8 @@ class Receipts:
         warning = f"\n  last recording error: {self._unrecorded[root]}" if root in self._unrecorded else ""
         who = ""
         if row is not None:
-            who = f"\n  checked by: model {row['model'] or 'not recorded'} · issuer {row['issuer'][:8] or 'not recorded'}" \
+            who = f"\n  checked by: model {field(row, 'model') or 'not recorded'} · issuer " \
+                  f"{field(row, 'issuer')[:8] or 'not recorded'}" \
                   f" (receipt #{row['id']}; /receipts show)"
         return (f"receipts — {root}\n  check: `{check}`\n  current content: tree {fp.tree[:10]}"
                 f"{' (uncommitted changes)' if not fp.clean else ''}\n  receipt: {state}{who}{warning}")
@@ -321,8 +322,8 @@ class Receipts:
         return (f"Receipt #{r['id']} — {r['status']}\n"
                 f"  check:    `{r['command']}` (exit {r['exit_code']}{took})\n"
                 f"  content:  tree {r['tree']}{commit}\n"
-                f"  model:    {r['model'] or 'not recorded'}\n"
-                f"  issuer:   {r['issuer'] or 'not recorded'}\n"
+                f"  model:    {field(r, 'model') or 'not recorded'}\n"
+                f"  issuer:   {field(r, 'issuer') or 'not recorded'}\n"
                 f"  session:  {r['session_id'] or 'not recorded'}\n"
                 f"  recorded: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r['created_at']))}\n"
                 f"  output:   sha256 {r['output_sha256']} ({r['output_chars']} chars)\n"

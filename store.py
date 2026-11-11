@@ -37,10 +37,16 @@ _SCHEMA = (
         session_id TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS receipts_root_tree ON receipts (root, tree, id)",
-    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
-# Columns added after 0.1.x; older ledgers gain them in place.
+# Added after 0.1.x; older ledgers gain these in place when they can be written.
+_META = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 _ADDED_COLUMNS = (("model", "TEXT NOT NULL DEFAULT ''"), ("issuer", "TEXT NOT NULL DEFAULT ''"))
+_RETRY_UPGRADE_S = 60.0
+
+
+def field(row, name: str) -> str:
+    """A column added after 0.1.x, or "" when this ledger could not be upgraded."""
+    return (row[name] or "") if name in row.keys() else ""
 
 
 def data_dir() -> Path:
@@ -57,20 +63,38 @@ def data_dir() -> Path:
 class Store:
     def __init__(self, path: Path | None = None):
         self.path = path or (data_dir() / "receipts.db")
+        self._upgraded = False
+        self._upgrade_after = 0.0
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5)
         conn.row_factory = sqlite3.Row
         for ddl in _SCHEMA:
             conn.execute(ddl)
-        have = {row["name"] for row in conn.execute("PRAGMA table_info(receipts)")}
-        for name, ddl in _ADDED_COLUMNS:
-            if name not in have:
-                try:
-                    conn.execute(f"ALTER TABLE receipts ADD COLUMN {name} {ddl}")
-                except sqlite3.OperationalError:   # another process added it first
-                    pass
+        self._upgrade(conn)
         return conn
+
+    def _upgrade(self, conn: sqlite3.Connection) -> None:
+        """Add the 0.2 table and columns. Best effort: a ledger that cannot be written
+        right now (read-only, locked by another process) keeps working as a 0.1 ledger."""
+        if self._upgraded or time.monotonic() < self._upgrade_after:
+            return
+        try:
+            have = {row["name"] for row in conn.execute("PRAGMA table_info(receipts)")}
+            missing = [(n, ddl) for n, ddl in _ADDED_COLUMNS if n not in have]
+            has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+            if missing or not has_meta:
+                conn.execute("PRAGMA busy_timeout = 250")     # never hold the gate up for an upgrade
+                try:
+                    with conn:
+                        conn.execute(_META)
+                        for name, ddl in missing:
+                            conn.execute(f"ALTER TABLE receipts ADD COLUMN {name} {ddl}")
+                finally:
+                    conn.execute("PRAGMA busy_timeout = 5000")
+            self._upgraded = True
+        except sqlite3.Error:
+            self._upgrade_after = time.monotonic() + _RETRY_UPGRADE_S
 
     # ── identity ────────────────────────────────────────────────────────────
     def issuer_id(self) -> str:

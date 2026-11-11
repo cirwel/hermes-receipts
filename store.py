@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -36,7 +37,10 @@ _SCHEMA = (
         session_id TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS receipts_root_tree ON receipts (root, tree, id)",
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
+# Columns added after 0.1.x; older ledgers gain them in place.
+_ADDED_COLUMNS = (("model", "TEXT NOT NULL DEFAULT ''"), ("issuer", "TEXT NOT NULL DEFAULT ''"))
 
 
 def data_dir() -> Path:
@@ -59,7 +63,21 @@ class Store:
         conn.row_factory = sqlite3.Row
         for ddl in _SCHEMA:
             conn.execute(ddl)
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(receipts)")}
+        for name, ddl in _ADDED_COLUMNS:
+            if name not in have:
+                try:
+                    conn.execute(f"ALTER TABLE receipts ADD COLUMN {name} {ddl}")
+                except sqlite3.OperationalError:   # another process added it first
+                    pass
         return conn
+
+    # ── identity ────────────────────────────────────────────────────────────
+    def issuer_id(self) -> str:
+        """The id this ledger issues receipts under: minted once, then stable."""
+        with _LOCK, closing(self._connect()) as conn, conn:
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('issuer', ?)", (str(uuid.uuid4()),))
+            return conn.execute("SELECT value FROM meta WHERE key = 'issuer'").fetchone()["value"]
 
     # ── settings ────────────────────────────────────────────────────────────
     def check_for(self, root: str) -> str | None:
@@ -83,13 +101,14 @@ class Store:
     # ── receipts ────────────────────────────────────────────────────────────
     def add(self, *, root: str, command: str, tree: str, head_tree: str, overlay: dict, status: str,
             exit_code: int | None, duration_ms: int | None, output_sha256: str, output_chars: int,
-            session_id: str) -> int:
+            session_id: str, model: str = "", issuer: str = "") -> int:
         with _LOCK, closing(self._connect()) as conn, conn:
             cur = conn.execute(
                 "INSERT INTO receipts (created_at, root, command, tree, head_tree, overlay_json, status, exit_code,"
-                " duration_ms, output_sha256, output_chars, session_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " duration_ms, output_sha256, output_chars, session_id, model, issuer)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), root, command, tree, head_tree, json.dumps(overlay, sort_keys=True), status,
-                 exit_code, duration_ms, output_sha256, output_chars, session_id or ""))
+                 exit_code, duration_ms, output_sha256, output_chars, session_id or "", model or "", issuer or ""))
             conn.execute("DELETE FROM receipts WHERE root = ? AND id NOT IN "
                          "(SELECT id FROM receipts WHERE root = ? ORDER BY id DESC LIMIT ?)",
                          (root, root, MAX_RECEIPTS_PER_REPO))

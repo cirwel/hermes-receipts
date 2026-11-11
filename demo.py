@@ -73,6 +73,11 @@ def main():
             print(data.get("output", "").strip())
             assert data.get("exit_code") == expected_exit, data
 
+        # No model is called here. Hermes's real dispatcher delivers the model name the
+        # way it does before a turn, so the receipts below show where it is recorded.
+        invoke_hook("pre_llm_call", session_id="receipts-demo", model="demo-model (no LLM call)",
+                    user_message="", conversation_history=[], is_first_turn=True, platform="cli")
+
         try:
             execute("git push origin main", blocked=True)
             execute("python3 check.py")
@@ -89,6 +94,10 @@ def main():
             git("commit", "-qm", "fix and verify before commit")
             execute("git push origin main")
             print("\n" + handler("log"))
+            shown = handler("show")
+            print("\n" + shown)
+            assert "model:    demo-model (no LLM call)" in shown, "model was not recorded on the receipt"
+            assert "issuer:   not recorded" not in shown, "issuer was not recorded on the receipt"
             assert git("rev-parse", "HEAD") == git("ls-remote", "origin", "refs/heads/main").split()[0]
             print("\nPASS: untested and stale content blocked; checked content reached the local remote.")
         finally:

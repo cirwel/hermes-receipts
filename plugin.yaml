@@ -1,6 +1,6 @@
 manifest_version: 1
 name: receipts
-version: "0.1.1"
+version: "0.2.0"
 description: "Binds verification results to Git content and blocks supported terminal pushes and PR creation until the configured check passes for the published tree."
 author: Kenny Wang
 license: Apache-2.0
@@ -8,3 +8,4 @@ requires_hermes: ">=0.22.0"
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+  - pre_llm_call

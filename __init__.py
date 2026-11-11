@@ -5,7 +5,8 @@ pre_tool_call (terminal tool only):
     tree of each pushed commit has a passing receipt for that check;
   * a terminal run of exactly the configured check gets a "before" fingerprint;
   * `hermes receipts check|clear` from the agent is refused (configuration is the user's).
-post_tool_call: records the receipt (passed / failed / changed-during-run).
+post_tool_call: records the receipt (passed / failed / changed-during-run), with the model that was
+  driving the session (observed in pre_llm_call) and this ledger's issuer id.
 Returns only `block` or nothing; never `approve`. Inactive on non-local terminal backends.
 Multiplexed profiles cannot earn receipts; recognized publishing commands are explicitly blocked.
 """
@@ -23,7 +24,8 @@ if __package__:
 
 BUDGET_S = 8.0          # well under the 30 s fail-closed hook deadline
 _MULTIPLEX_UNSUPPORTED = "multiplexed profiles are not supported in this release"
-_pending: dict[str, tuple[str, str, object, float]] = {}   # tool_call_id -> (root, cmd, fp, t0)
+_pending: dict[str, tuple[str, str, object, float, str]] = {}   # call id -> (root, cmd, fp, t0, model)
+MAX_TRACKED_SESSIONS = 256
 
 
 def _check_error(command: str, root: str) -> str | None:
@@ -76,6 +78,20 @@ class Receipts:
         self.store = store or Store()
         self._unrecorded: dict[str, str] = {}
         self._terminal_cwds: dict[str, str] = {}
+        self._models: dict[str, str] = {}     # session id -> model driving it (from pre_llm_call)
+
+    # ── provenance ─────────────────────────────────────────────────────────
+    def pre_llm_call(self, session_id: str = "", model: str = "", **_):
+        """Remember which model is driving a session. Observes only; never returns a directive."""
+        try:
+            if isinstance(model, str) and model.strip() and not _inactive_reason():
+                self._models.pop(session_id or "", None)
+                self._models[session_id or ""] = " ".join(model.split())[:120]
+                while len(self._models) > MAX_TRACKED_SESSIONS:
+                    self._models.pop(next(iter(self._models)))
+        except Exception:
+            pass
+        return None
 
     # ── gate ───────────────────────────────────────────────────────────────
     def pre_tool_call(self, tool_name: str = "", args: dict | None = None, tool_call_id: str = "",
@@ -111,7 +127,8 @@ class Receipts:
                 return {"action": "block", "message": msg}
 
         if not args.get("background"):
-            self._maybe_start_receipt(command, base, f"{session_id}\0{tool_call_id}" if tool_call_id else "", deadline)
+            self._maybe_start_receipt(command, base, f"{session_id}\0{tool_call_id}" if tool_call_id else "", deadline,
+                                      self._models.get(session_id or "", ""))
         return None
 
     def _gate(self, action, deadline: float) -> str | None:
@@ -171,7 +188,8 @@ class Receipts:
         return f" Changed since the last passing run: {shown}."
 
     # ── receipts ───────────────────────────────────────────────────────────
-    def _maybe_start_receipt(self, command: str, base: str, tool_call_id: str, deadline: float) -> None:
+    def _maybe_start_receipt(self, command: str, base: str, tool_call_id: str, deadline: float,
+                             model: str = "") -> None:
         if not tool_call_id:
             return
         root = None
@@ -183,7 +201,8 @@ class Receipts:
             run_dir = shell.check_invocation(command, check, base)
             if not run_dir or os.path.realpath(run_dir) != root:
                 return
-            _pending[tool_call_id] = (root, check, gitstate.fingerprint(root, deadline), time.time())
+            # The model is taken when the check starts: that is the one that ran it.
+            _pending[tool_call_id] = (root, check, gitstate.fingerprint(root, deadline), time.time(), model)
             self._unrecorded.pop(root, None)
         except Exception as exc:
             if root:
@@ -206,7 +225,7 @@ class Receipts:
         pending = _pending.pop(f"{session_id}\0{tool_call_id}", None) if tool_call_id else None
         if pending is None:
             return None
-        root, check, before, _t0 = pending
+        root, check, before, _t0, model = pending
         try:
             exit_code = data.get("exit_code") if isinstance(data, dict) else None
             output = str(data.get("output", "")) if isinstance(data, dict) else str(result)
@@ -221,7 +240,7 @@ class Receipts:
                            overlay=before.overlay, status=status, exit_code=exit_code,
                            duration_ms=int(duration_ms) if isinstance(duration_ms, (int, float)) else None,
                            output_sha256=hashlib.sha256(output.encode()).hexdigest(), output_chars=len(output),
-                           session_id=session_id or "")
+                           session_id=session_id or "", model=model, issuer=self.store.issuer_id())
         except Exception as exc:
             self._unrecorded[root] = str(exc)
         return None
@@ -250,9 +269,12 @@ class Receipts:
             return f"receipts: cleared {self.store.clear(root)} receipts for {root}."
         if sub == "log":
             rows = self.store.recent(root)
-            return "\n".join(f"{time.strftime('%H:%M:%S', time.localtime(r['created_at']))}  {r['status']:<8}"
-                             f" exit={r['exit_code']}  tree {r['tree'][:10]}  `{r['command']}`" for r in rows) \
+            return "\n".join(f"#{r['id']}  {time.strftime('%H:%M:%S', time.localtime(r['created_at']))}  "
+                             f"{r['status']:<8} exit={r['exit_code']}  tree {r['tree'][:10]}  `{r['command']}`"
+                             f"{'  model ' + r['model'] if r['model'] else ''}" for r in rows) \
                 or "receipts: no receipts yet."
+        if sub == "show":
+            return self._show(root, rest, deadline)
         check = self.store.check_for(root)
         if not check:
             return f"receipts: no check configured for {root}. Set one with /receipts check <command>."
@@ -266,13 +288,51 @@ class Receipts:
         state = "PASSED" if row is not None and row["status"] == "passed" else (
             "FAILED" if row is not None else "NO RECEIPT")
         warning = f"\n  last recording error: {self._unrecorded[root]}" if root in self._unrecorded else ""
+        who = ""
+        if row is not None:
+            who = f"\n  checked by: model {row['model'] or 'not recorded'} · issuer {row['issuer'][:8] or 'not recorded'}" \
+                  f" (receipt #{row['id']}; /receipts show)"
         return (f"receipts — {root}\n  check: `{check}`\n  current content: tree {fp.tree[:10]}"
-                f"{' (uncommitted changes)' if not fp.clean else ''}\n  receipt: {state}{warning}")
+                f"{' (uncommitted changes)' if not fp.clean else ''}\n  receipt: {state}{who}{warning}")
+
+    def _show(self, root: str, which: str, deadline: float) -> str:
+        """One receipt in full, as text that can be pasted into a pull request."""
+        rows = self.store.recent(root, 500)
+        if which:
+            wanted = which.lstrip("#")
+            rows = [r for r in rows if str(r["id"]) == wanted]
+            if not rows:
+                return f"receipts: no receipt #{wanted} for {root}."
+        elif (check := self.store.check_for(root)):
+            try:
+                tree = gitstate.fingerprint(root, deadline).tree
+            except gitstate.GitUnavailable as exc:
+                return f"receipts: cannot fingerprint this repository: {exc}."
+            current = self.store.latest_for_tree(root, tree, check)
+            if current is None:
+                return "receipts: no conclusive receipt for the current content. Use /receipts log to pick one."
+            rows = [current]
+        if not rows:
+            return "receipts: no receipts yet."
+        r = rows[0]
+        head = gitstate.commit_tree(root, "HEAD", deadline)
+        commit = f" (HEAD {head[0][:10]})" if head and head[1] == r["tree"] else ""
+        took = f", {r['duration_ms'] / 1000:.1f} s" if r["duration_ms"] is not None else ""
+        return (f"Receipt #{r['id']} — {r['status']}\n"
+                f"  check:    `{r['command']}` (exit {r['exit_code']}{took})\n"
+                f"  content:  tree {r['tree']}{commit}\n"
+                f"  model:    {r['model'] or 'not recorded'}\n"
+                f"  issuer:   {r['issuer'] or 'not recorded'}\n"
+                f"  session:  {r['session_id'] or 'not recorded'}\n"
+                f"  recorded: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r['created_at']))}\n"
+                f"  output:   sha256 {r['output_sha256']} ({r['output_chars']} chars)\n"
+                "  Recorded locally by the receipts plugin from Hermes hook data. Not a signature.")
 
 
 def register(ctx):
     service = Receipts()
     ctx.register_hook("pre_tool_call", service.pre_tool_call)
     ctx.register_hook("post_tool_call", service.post_tool_call)
+    ctx.register_hook("pre_llm_call", service.pre_llm_call)
     ctx.register_command("receipts", service.command, description="Verification receipts and the push gate",
-                         args_hint="[status|check <cmd>|log|clear]")
+                         args_hint="[status|check <cmd>|log|show [id]|clear]")

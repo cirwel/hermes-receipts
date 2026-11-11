@@ -56,6 +56,7 @@ again and retry. A failed run for the same content supersedes an earlier pass.
 | `/receipts` | Configured check and receipt for current working content |
 | `/receipts check <command>` | Set the exact check command for this repository |
 | `/receipts log` | Recent passes, failures, unknown results and changes during a run |
+| `/receipts show [id]` | One receipt in full: check, content, model, issuer, session and time |
 | `/receipts clear` | Remove this repository's receipt history |
 | `/receipts check --off` | Turn the gate off for this repository |
 
@@ -75,6 +76,39 @@ then configure the script itself:
 Previously saved unsupported checks show repair guidance in `/receipts` and
 the push-block message. Unconfigured repositories are unaffected in supported
 single-profile mode.
+
+## Who checked it
+
+Each receipt also records who ran the check:
+
+- **Model:** the model driving the Hermes session when the check started,
+  taken from Hermes's `pre_llm_call` hook. The plugin reads only the session id
+  and model name from that hook; it does not read or change prompts, and it
+  returns nothing. If Hermes has not reported a model, the field is empty; the
+  plugin never guesses one.
+- **Issuer:** an id the plugin mints once per ledger and then reuses, so
+  receipts from one Hermes install can be told apart from another's.
+- **Session:** the Hermes session id.
+
+`/receipts show` prints the receipt for the current content as text you can
+paste into a pull request:
+
+```text
+Receipt #3 — passed
+  check:    `python3 check.py` (exit 0)
+  content:  tree 95862da741f61e3dea33204562e1421ef904c377 (HEAD ff7a3fbb0c)
+  model:    demo-model (no LLM call)
+  issuer:   ac2cf283-f7ec-43b9-bd90-6979162c533b
+  session:  receipts-demo
+  recorded: 2026-11-11T05:26:27Z
+  output:   sha256 0153121493dc… (12 chars)
+  Recorded locally by the receipts plugin from Hermes hook data. Not a signature.
+```
+
+These fields describe a local record. Anyone who can write the ledger file can
+change them, so they are provenance for honest setups, not proof against a
+forger. Ledgers from 0.1.x gain the new fields in place; older receipts show
+them as not recorded.
 
 ## Without Hermes: a Git pre-push hook
 

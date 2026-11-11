@@ -209,7 +209,7 @@ def cmd_run(store, repo: Repo, args) -> int:
     store.add(root=repo.key, command=check, tree=before.tree, head_tree=before.head_tree, overlay=before.overlay,
               status=status, exit_code=code, duration_ms=int((time.time() - started) * 1000),
               output_sha256=digest.hexdigest(), output_chars=size,
-              session_id=args.actor or os.environ.get("RECEIPTS_ACTOR") or "")
+              session_id=args.actor or os.environ.get("RECEIPTS_ACTOR") or "", issuer=store.issuer_id())
     if status == "changed":
         shown = ", ".join(moved[:5]) or "the commit under it"
         _say(f"receipts: NO RECEIPT — the content changed while the check ran ({shown}). "

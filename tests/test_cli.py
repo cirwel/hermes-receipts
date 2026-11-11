@@ -176,6 +176,16 @@ class CliTest(unittest.TestCase):
         self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
         self.assertIn("[receipts] Blocked", blocked.stdout)
 
+    def test_remote_ref_with_unicode_spaces_cannot_hide_the_pushed_commit(self):
+        self.configure()
+        self.assertEqual(self.cli("run").returncode, 0)
+        self.assertEqual(self.push("HEAD:refs/heads/a\u00a0b").returncode, 0)      # checked content, odd name: allowed
+        self.write("answer.txt", "ok, unchecked\n")
+        self.git("commit", "-q", "-am", "unchecked")
+        hidden = self.push("HEAD:refs/heads/a\u00a0" + "0" * 40 + "\u00a0b")
+        self.assertNotEqual(hidden.returncode, 0, hidden.stdout)
+        self.assertIn("[receipts] Blocked", hidden.stdout)
+
     def test_unreadable_hook_input_blocks(self):
         self.configure()
         result = self.cli("hook", "pre-push", "origin", "url", stdin="garbage line\n")

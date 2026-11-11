@@ -34,7 +34,9 @@ _SCHEMA = (
         duration_ms INTEGER,
         output_sha256 TEXT NOT NULL,
         output_chars INTEGER NOT NULL,
-        session_id TEXT NOT NULL
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        issuer TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS receipts_root_tree ON receipts (root, tree, id)",
 )
@@ -68,10 +70,16 @@ class Store:
 
     def _connect(self, writing: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        for ddl in _SCHEMA:
-            conn.execute(ddl)
-        self._upgrade(conn, force=writing)
+        try:
+            conn.row_factory = sqlite3.Row
+            for ddl in _SCHEMA:
+                conn.execute(ddl)
+            # Read from the file each time: the ledger may have been replaced since the last call.
+            self._upgraded = self._is_upgraded(conn)
+            self._upgrade(conn, force=writing)
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def _upgrade(self, conn: sqlite3.Connection, force: bool = False) -> None:
@@ -99,7 +107,19 @@ class Store:
                     conn.execute("PRAGMA busy_timeout = 5000")
             self._upgraded = True
         except sqlite3.Error:
-            self._upgrade_after = time.monotonic() + _RETRY_UPGRADE_S
+            if self._is_upgraded(conn):       # another process finished the same upgrade first
+                self._upgraded = True
+            else:
+                self._upgrade_after = time.monotonic() + _RETRY_UPGRADE_S
+
+    @staticmethod
+    def _is_upgraded(conn: sqlite3.Connection) -> bool:
+        try:
+            have = {row["name"] for row in conn.execute("PRAGMA table_info(receipts)")}
+            meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+            return bool(meta) and all(name in have for name, _ in _ADDED_COLUMNS)
+        except sqlite3.Error:
+            return False
 
     # ── identity ────────────────────────────────────────────────────────────
     def issuer_id(self) -> str:

@@ -263,6 +263,185 @@ class RepoCase(unittest.TestCase):
                   duration_ms=1, output_sha256="h", output_chars=1, session_id="s", model="m", issuer="i")
         self.assertEqual(store.latest_for_tree("r", "t2", "c")["model"], "m")
 
+    # ── commands that choose their repository indirectly ───────────────────
+    def outside(self):
+        other = Path(self.tmp.name).resolve() / "elsewhere"
+        other.mkdir(exist_ok=True)
+        return str(other)
+
+    def pre_at(self, command, workdir, **extra):
+        return self.service.pre_tool_call("terminal", {"command": command, "workdir": workdir, **extra}, "call")
+
+    def test_repository_chosen_by_option_or_variable_cannot_slip_past(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        git_dir = str(self.root / ".git")
+        inside = [f"git --work-tree={self.outside()} push origin main",
+                  f"git --work-tree {self.outside()} push origin main",
+                  "git --namespace ns push origin main:refs/heads/main",
+                  "git --exec-path=/tmp/x push origin main"]
+        elsewhere = [f"git --git-dir={git_dir} push origin main",
+                     f"git --git-dir {git_dir} push origin main",
+                     f"GIT_DIR={git_dir} git push origin main",
+                     f"env GIT_DIR={git_dir} git push origin main",
+                     'git -C "$REPO" push origin main',
+                     "cd $REPO && git push origin main",
+                     'cd "$REPO" && git push origin main']
+        for command in inside:
+            with self.subTest(inside=command):
+                self.assertEqual((self.pre_at(command, str(self.root)) or {}).get("action"), "block")
+        for command in elsewhere:
+            with self.subTest(elsewhere=command):
+                self.assertEqual((self.pre_at(command, self.outside()) or {}).get("action"), "block")
+
+    def test_passing_receipt_does_not_cover_a_namespaced_or_redirected_push(self):
+        self.run_check()
+        self.assertIsNone(self.pre("git push origin main"))
+        self.assertEqual(self.pre("git --namespace ns push origin main")["action"], "block")
+        self.assertEqual(self.pre(f"git --work-tree={self.outside()} push origin main")["action"], "block")
+
+    def test_indirect_repository_is_not_blocked_when_nothing_is_configured(self):
+        git_dir = str(self.root / ".git")
+        for command in (f"git --git-dir={git_dir} push origin main", "cd $REPO && git push origin main"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.pre_at(command, self.outside()))
+
+    def test_plain_push_elsewhere_is_never_blocked_by_another_repositorys_check(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        for command in ("git push origin main", "git push origin $BRANCH", "GIT_SSH_COMMAND=ssh git push origin main"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.pre_at(command, self.outside()))
+
+    def test_deletions_and_dry_runs_are_not_blocked(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        for command in ("git push origin :topic", f"git -C {self.root} push -n origin main",
+                        f"cd {self.root} && git push -d origin topic", "git push --dry-run origin main"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.pre(command))
+        for command in ('git push -n origin main; eval "git push origin main"',
+                        "git push origin :topic && git push origin main"):
+            with self.subTest(command=command):
+                self.assertEqual(self.pre(command)["action"], "block")
+
+    def test_malformed_hook_arguments_never_raise(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        with patch.object(receipts, "_agent_cwd", return_value=str(self.root)):
+            blocked = self.service.pre_tool_call("terminal", {"command": "git push origin main", "workdir": 123}, "c")
+            self.assertEqual(blocked["action"], "block")
+            self.assertIsNone(self.service.pre_tool_call("terminal", {"command": "ls", "workdir": 123}, "c2"))
+        self.service.post_tool_call("terminal", "c3", json.dumps({"exit_code": 0}), args="not a dict")
+        self.service.post_tool_call("terminal", "c4", json.dumps({"exit_code": 0}), args=["x"])
+
+    def test_model_is_forgotten_when_hermes_stops_reporting_one(self):
+        self.service.pre_llm_call(session_id="s1", model="model-a")
+        self.service.pre_llm_call(session_id="s1", model="")
+        self.assertEqual(self.checked()["model"], "")
+        self.service.pre_llm_call(session_id=None, model="model-b")
+        self.assertEqual(self.service._models, {})
+
+    def test_upgrade_that_another_process_finished_first_still_counts(self):
+        import sqlite3
+        path = self.old_ledger("raced.db")
+        store = Store(path)
+        real = sqlite3.Connection.execute
+        original = sqlite3.connect
+        raced = []
+
+        class Racing(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql.startswith("CREATE TABLE IF NOT EXISTS meta") and not raced:
+                    raced.append(True)
+                    other = original(path)              # the other process wins the race
+                    other.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                    other.execute("ALTER TABLE receipts ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+                    other.execute("ALTER TABLE receipts ADD COLUMN issuer TEXT NOT NULL DEFAULT ''")
+                    other.commit()
+                    other.close()
+                return real(self, sql, *args)
+
+        with patch.object(sqlite3, "connect", lambda *a, **k: original(*a, factory=Racing, **k)):
+            issuer = store.issuer_id()
+        self.assertEqual(raced, [True])
+        self.assertEqual(len(issuer), 36)
+
+    # ── whole-plugin review findings ───────────────────────────────────────
+    def test_subshell_cd_does_not_move_the_check_or_the_push(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        # the cd happens in a subshell, so the check would really run outside the repository
+        self.assertIsNone(self.pre_at(f"(cd {self.root}) && python3 -m unittest", self.outside()))
+        self.service.post_tool_call("terminal", "call", json.dumps({"exit_code": 0, "output": "ok"}))
+        self.assertEqual(self.store.recent(str(self.root)), [])
+        self.assertIsNone(shell.check_invocation(f"(cd {self.root}) && python3 -m unittest",
+                                                 "python3 -m unittest", self.outside()))
+        for command in (f"(cd {self.outside()}) && git push origin HEAD", f"(cd {self.outside()}); git push origin HEAD",
+                        "(git push origin HEAD)"):
+            with self.subTest(command=command):
+                self.assertEqual((self.pre(command) or {}).get("action"), "block")
+        with self.subTest("from elsewhere"):
+            blocked = self.pre_at(f"(cd {self.root} && git push origin HEAD)", self.outside())
+            self.assertEqual((blocked or {}).get("action"), "block")
+
+    def test_line_continuations_do_not_hide_a_push(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        for command in ("git \\\n  push origin HEAD", f"git -C {self.root} \\\n push origin HEAD",
+                        "gh pr \\\n create --fill", "git pu\\\nsh origin HEAD"):
+            with self.subTest(command=command):
+                self.assertEqual((self.pre(command) or {}).get("action"), "block")
+
+    def test_matching_refspec_and_attached_gh_flags(self):
+        self.run_check()
+        self.git("branch", "feature")
+        self.write("top.txt", "unchecked on feature\n")
+        self.git("checkout", "-q", "feature")
+        self.commit()
+        self.git("checkout", "-q", "main")
+        self.assertIsNone(self.pre("git push origin main"))
+        for command in ("git push origin main :", "git push origin +:", "git push -o -n origin :",
+                        "gh pr create -Hfeature --fill", "gh pr create -Rowner/repo --fill"):
+            with self.subTest(command=command):
+                self.assertEqual((self.pre(command) or {}).get("action"), "block")
+        self.assertIsNone(self.pre("gh pr create --fill"))
+
+    def test_cd_forms_that_cannot_be_followed(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        for command in ("cd - && git push origin HEAD", "cd -P . && git push origin HEAD"):
+            with self.subTest(command=command):
+                self.assertEqual((self.pre(command) or {}).get("action"), "block")
+                self.assertEqual((self.pre_at(command, self.outside()) or {}).get("action"), "block")
+
+    def test_gate_errors_block_a_push_and_let_other_commands_run(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        with patch.object(receipts, "_inactive_reason", side_effect=AttributeError("plugins: null")):
+            self.assertEqual(self.pre("git push origin main")["action"], "block")
+            self.assertIsNone(self.pre("ls"))
+        failing = gitstate.GitUnavailable("fatal: detected dubious ownership in repository")
+        with patch.object(gitstate, "git", side_effect=failing):
+            self.assertEqual(self.pre("git push origin main")["action"], "block")
+        self.assertIsNone(self.pre_at("git push origin main", self.outside()))      # really not a repository
+
+    def test_inactive_reason_tolerates_empty_config_sections(self):
+        import types
+        fake = types.ModuleType("hermes_cli.config")
+        fake.load_config = lambda: {"plugins": None, "terminal": None}
+        scope = types.ModuleType("agent.secret_scope")
+        scope.is_multiplex_active = lambda: False
+        with patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.secret_scope": scope,
+                                      "hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.config": fake}):
+            self.assertEqual(receipts._inactive_reason(), "")
+
+    def test_directory_replaced_by_symlink(self):
+        self.write("other/file.txt", "v2\n")
+        self.write("sub/file.txt", "v1\n")
+        self.commit()
+        shutil.rmtree(self.root / "sub")
+        os.symlink("other", self.root / "sub")
+        self.assertFalse(self.assert_tree().clean)
+
+    def test_ledger_recreated_mid_session_still_records(self):
+        self.assertEqual(len(self.store.issuer_id()), 36)
+        os.unlink(self.store.path)
+        row = self.checked()
+        self.assertEqual((row["status"], len(row["issuer"])), ("passed", 36))
+
     def test_commit_resolution(self):
         self.assertEqual(gitstate.commit_tree(str(self.root), "HEAD", time.monotonic() + 5),
                          (self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")))

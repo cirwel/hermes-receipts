@@ -197,6 +197,19 @@ own terminal are outside the gate. It does not prove that the chosen check is
 sufficient, or fingerprint ignored files, dependencies, environment variables,
 external services or changes that occur and revert between observations.
 
+A push that chooses its repository indirectly (`--git-dir`, `GIT_DIR` and
+related variables, or a `cd` / `-C` path the plugin cannot read, such as one
+containing a shell variable) is blocked whenever any repository has a check
+configured, because where the command runs no longer says which repository it
+publishes from. `--work-tree`, `--namespace`, `--exec-path` and `-c` overrides
+are refused inside a configured repository. Deleting a remote branch and dry
+runs publish nothing and are not gated.
+
+Commands that use subshell parentheses are not parsed: a push inside one is
+refused, and a check run that way earns no receipt. A bare `:` refspec, which
+pushes every matching branch, is refused. If the gate itself fails while
+evaluating a publishing command, that command is refused; other commands run.
+
 Repositories with submodules, embedded repositories, sparse/assume-unchanged
 entries, unresolved index conflicts, or configured external clean/process filters
 cannot earn new receipts. Fingerprinting has an eight-second budget. Checks still
@@ -206,8 +219,8 @@ The plugin runs local Git subprocesses. Fingerprinting disables Git hooks,
 fsmonitor and lazy fetch, and refuses external clean/process filters before
 running Git status. It stores settings and up to 500 receipts per repository in
 `plugin-data/receipts/receipts.db` under the active Hermes home. Records contain
-repository paths, command text, tree/file hashes, exit status, timestamps and
-session identifiers. Command output is represented by a SHA-256 digest and
+repository paths, command text, tree/file hashes, exit status, timestamps,
+session identifiers, the session's model name and the ledger's issuer id. Command output is represented by a SHA-256 digest and
 character count, not saved as text. Receipts makes no network requests.
 
 ## Validation and reproducible demo

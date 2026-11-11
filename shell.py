@@ -21,6 +21,10 @@ _SHELLS = {"sh", "bash", "zsh", "dash"}
 _OPAQUE_HINT = re.compile(r"\bgit\b[^\n;|&]*\bpush\b|\bgh\b[^\n;|&]*\bpr\b[^\n;|&]*\bcreate\b")
 _GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--exec-path"}
 _PUSH_OPTS_WITH_VALUE = {"-o", "--push-option"}
+# Options and variables that make git use a repository other than the one found from the cwd.
+_RELOCATING_ENV = re.compile(r"\bGIT_(?:DIR|WORK_TREE|COMMON_DIR|NAMESPACE|INDEX_FILE|OBJECT_DIRECTORY|"
+                             r"ALTERNATE_OBJECT_DIRECTORIES|CONFIG[A-Z_]*)=")
+_UNVERIFIABLE_GIT_OPTS = ("-c", "--config-env", "--git-dir", "--work-tree", "--namespace", "--exec-path")
 
 
 @dataclass
@@ -29,6 +33,7 @@ class Action:
     cwd: str
     refs: list[str] = field(default_factory=list)   # revisions whose trees must have receipts
     unverifiable: str = ""        # non-empty: reason the target cannot be determined
+    elsewhere: bool = False       # the repository is chosen by something other than ``cwd``
     text: str = ""
 
 
@@ -38,6 +43,7 @@ def _split(command: str) -> list[list[str]] | None:
         return None
     if "`" in command or "$(" in command or "<(" in command:
         return None
+    command = _fold(command)
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
         lexer.whitespace = " \t\r"
@@ -50,11 +56,30 @@ def _split(command: str) -> list[list[str]] | None:
     for word in words:
         if word in _SEPARATORS or word == "\n":
             segments.append([])
+        elif word and all(c in "()" for c in word):
+            return None           # a subshell or group: a cd inside it does not move what follows
         elif word and all(c in ";&|()" for c in word):
+            if "(" in word or ")" in word:
+                return None
             segments.append([])
         else:
             segments[-1].append(word)
     return [s for s in segments if s]
+
+
+def _fold(command: str) -> str:
+    """Join lines the shell would join: a backslash before a newline continues the line."""
+    return command.replace("\\\n", "")
+
+
+_RELOCATES = re.compile(r"\b(?:cd|pushd|popd|eval|source)\b|(?:^|\s)-C|--git-dir|--work-tree|(?:^|[\s;&|(])\.\s")
+
+
+def _opaque(command: str, cwd: str) -> list["Action"]:
+    """An unparsed command that mentions a push. If it also contains anything that can change
+    directory or repository, where it publishes from is unknown."""
+    lost = bool(_RELOCATES.search(command) or _RELOCATING_ENV.search(command))
+    return [Action("opaque", cwd, text=command, elsewhere=lost)]
 
 
 def _unwrap(words: list[str]) -> list[str]:
@@ -81,21 +106,28 @@ def _static(value: str) -> bool:
     return bool(value) and not any(c in (value[2:] if value.startswith("~/") else value) for c in "$`*?{}~")
 
 
-def _git_parts(words: list[str], cwd: str) -> tuple[str, list[str], str]:
+def _git_parts(words: list[str], cwd: str) -> tuple[str, list[str], str, list[str], bool]:
+    """(subcommand, its arguments, cwd, git's own options, repository-chosen-elsewhere)."""
     i = 1
+    elsewhere = False
     while i < len(words) and words[i].startswith("-"):
         opt = words[i]
         i += 1
         if opt in _GIT_OPTS_WITH_VALUE and i < len(words):
-            if opt == "-C" or opt == "--work-tree":
+            if opt == "-C":
+                elsewhere = elsewhere or not _static(words[i])
                 cwd = _resolve(words[i], cwd)
+            elif opt == "--git-dir":
+                elsewhere = True
             i += 1
-        elif opt.startswith("--work-tree="):
-            cwd = _resolve(opt.partition("=")[2], cwd)
+        elif opt.startswith("--git-dir="):
+            elsewhere = True
         elif opt.startswith("-C") and len(opt) > 2:
+            elsewhere = elsewhere or not _static(opt[2:])
             cwd = _resolve(opt[2:], cwd)
+        # --work-tree does not change which repository git finds, so it never moves cwd.
     sub = words[i] if i < len(words) else ""
-    return sub, words[i + 1:], cwd
+    return sub, words[i + 1:], cwd, words[1:i], elsewhere
 
 
 def _push_refs(args: list[str]) -> tuple[list[str], str, bool]:
@@ -129,7 +161,9 @@ def _push_refs(args: list[str]) -> tuple[list[str], str, bool]:
         return [], "specify the remote and source explicitly, for example `git push origin HEAD`", False
     revs = []
     for spec in refspecs:
-        src = spec.lstrip("+").partition(":")[0]
+        src, _, dst = spec.lstrip("+").partition(":")
+        if not src and not dst:   # ":" alone pushes every matching branch
+            return [], "a bare `:` refspec pushes every matching branch", False
         if not src:           # ":branch" deletes a remote branch
             continue
         if not _static(src) or src == "tag" or src.startswith("-"):
@@ -144,15 +178,20 @@ def _pr_refs(args: list[str]) -> list[str]:
             return [args[i + 1].rpartition(":")[2]]
         if a.startswith("--head="):
             return [a.partition("=")[2].rpartition(":")[2]]
+        if a.startswith("-H") and len(a) > 2:
+            return [a[2:].lstrip("=").rpartition(":")[2]]
     return ["HEAD"]
 
 
 def guarded_actions(command: str, cwd: str, guard_pr: bool = True, _depth: int = 0) -> list[Action]:
     """Every ``git push`` / ``gh pr create`` the command would run, with its repository cwd."""
+    command = _fold(command)
     segments = _split(command)
     if segments is None:
-        return [Action("opaque", cwd, text=command)] if _OPAQUE_HINT.search(command) else []
+        return _opaque(command, cwd) if _OPAQUE_HINT.search(command) else []
     actions: list[Action] = []
+    lost = bool(_RELOCATING_ENV.search(command))   # the repository is no longer known from cwd
+    harmless = 0                                   # segments that are a cd, or a push that publishes nothing
     for raw in segments:
         words = _unwrap(raw)
         if not words:
@@ -160,27 +199,36 @@ def guarded_actions(command: str, cwd: str, guard_pr: bool = True, _depth: int =
         name = os.path.basename(words[0])
         if name == "cd":
             target = words[1] if len(words) > 1 else "~"
-            if _static(target):
+            if len(words) <= 2 and _static(target) and not target.startswith("-"):
                 cwd = _resolve(target, cwd)
+            else:
+                lost = True               # options, `cd -`, variables: the destination is unknown
+            harmless += 1
             continue
         if name in _SHELLS and len(words) >= 3 and words[1] in ("-c", "-lc", "-ec") and _depth < 2:
-            actions += guarded_actions(words[2], cwd, guard_pr, _depth + 1)
+            nested = guarded_actions(words[2], cwd, guard_pr, _depth + 1)
+            for action in nested:
+                action.elsewhere = action.elsewhere or lost
+            actions += nested
             continue
         if name == "git":
-            sub, args, gcwd = _git_parts(words, cwd)
+            sub, args, gcwd, opts, moved = _git_parts(words, cwd)
             if sub == "push":
                 refs, why, skip = _push_refs(args)
-                if not skip:
-                    actions.append(Action("push", gcwd, refs=refs, unverifiable=why, text=" ".join(raw)))
-                    if any(w.startswith(("-c", "--config-env", "--git-dir", "--work-tree")) for w in words[1:words.index("push")]):
-                        actions[-1].unverifiable = "Git configuration overrides are not supported"
+                if skip:
+                    harmless += 1
+                else:
+                    actions.append(Action("push", gcwd, refs=refs, unverifiable=why, text=" ".join(raw),
+                                          elsewhere=lost or moved))
+                    if any(w.startswith(_UNVERIFIABLE_GIT_OPTS) for w in opts):
+                        actions[-1].unverifiable = "Git configuration and repository overrides are not supported"
         elif name == "gh" and guard_pr and len(words) >= 3 and words[1] == "pr" and words[2] == "create":
-            actions.append(Action("pr-create", cwd, refs=_pr_refs(words[3:]), text=" ".join(raw)))
-            if any(w in {"-R", "--repo"} or w.startswith("--repo=") for w in words[3:]):
+            actions.append(Action("pr-create", cwd, refs=_pr_refs(words[3:]), text=" ".join(raw), elsewhere=lost))
+            if any(w in {"-R", "--repo"} or w.startswith(("--repo=", "-R")) for w in words[3:]):
                 actions[-1].unverifiable = "cross-repository PR creation is not supported"
     if actions and len(segments) > 1:
         safe_cd = len(segments) == 2 and len(segments[0]) == 2 and segments[0][0] == "cd" \
-            and _static(segments[0][1]) and "&&" in command and not any(c in command for c in ";|\n")
+            and _static(segments[0][1]) and not segments[0][1].startswith("-") and "&&" in command and not any(c in command for c in ";|\n")
         if not safe_cd:
             for action in actions:
                 action.unverifiable = "run the push or PR creation separately from other commands"
@@ -188,9 +236,10 @@ def guarded_actions(command: str, cwd: str, guard_pr: bool = True, _depth: int =
         for action in actions:
             action.unverifiable = "dynamic paths or environment overrides are not supported"
     if not actions and _OPAQUE_HINT.search(command):
-        if not (len(segments) == 1 and len(segments[0]) >= 2 and segments[0][:2] == ["git", "push"]
-                and any(w in {"--delete", "-d", "--dry-run", "-n"} for w in segments[0])):
-            return [Action("opaque", cwd, text=command)]
+        # Deletions and dry runs publish nothing. Anything else that mentions a push but was
+        # not recognised stays opaque, including when it merely follows a harmless push.
+        if harmless != len(segments):
+            return _opaque(command, cwd)
     return actions
 
 
@@ -198,7 +247,8 @@ def invocation_cwd(command: str, cwd: str) -> str:
     """Resolve a static leading cd so callers can find the target's settings."""
     segments = _split(command)
     if segments and len(segments) == 2 and len(segments[0]) == 2 \
-            and segments[0][0] == "cd" and _static(segments[0][1]) and "&&" in command:
+            and segments[0][0] == "cd" and _static(segments[0][1]) and not segments[0][1].startswith("-") \
+            and "&&" in command:
         return _resolve(segments[0][1], cwd)
     return cwd
 
@@ -217,7 +267,8 @@ def check_invocation(command: str, check: str, cwd: str) -> str | None:
         return None
     if len(segments) == 2:
         first = segments[0]
-        if len(first) != 2 or first[0] != "cd" or not _static(first[1]) or "&&" not in command:
+        if len(first) != 2 or first[0] != "cd" or not _static(first[1]) or first[1].startswith("-") \
+                or "&&" not in command:
             return None
         cwd = _resolve(first[1], cwd)
         segments = segments[1:]
@@ -239,6 +290,7 @@ def check_invocation(command: str, check: str, cwd: str) -> str | None:
 
 def is_receipts_config_change(command: str) -> bool:
     """True when the agent tries to change receipts configuration through the CLI."""
+    command = _fold(command)
     segments = _split(command)
     if segments is None:
         return bool(re.search(r"\bhermes\b[^\n;|&]*\breceipts\b[^\n;|&]*\b(check|clear|off)\b", command))

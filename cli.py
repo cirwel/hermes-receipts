@@ -78,6 +78,24 @@ class Repo:
                               deadline=deadline).decode().strip()
         return cls(root, os.path.realpath(common))
 
+    @classmethod
+    def for_hook(cls) -> "Repo | None":
+        """The repository Git is pushing from, taken from the hook's own environment.
+
+        Git may run the hook with GIT_DIR set and a cwd that is not a worktree (a bare
+        repository, or --git-dir); the cwd alone could name no repository or the wrong one.
+        """
+        def ask(*args: str) -> str:
+            proc = subprocess.run(["git", "rev-parse", "--path-format=absolute", *args], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=BUDGET_S)
+            return proc.stdout.decode().strip() if proc.returncode == 0 else ""
+        common = ask("--git-common-dir")
+        if not common:
+            return None
+        key = os.path.realpath(common)
+        top = ask("--show-toplevel")
+        return cls(os.path.realpath(top) if top else key, key)
+
 
 def _say(text: str) -> None:
     print(text, file=sys.stderr)
@@ -130,6 +148,8 @@ def cmd_check(store, repo: Repo, args) -> int:
         store.set_check(repo.key, None)
         print(f"receipts: removed the check for {repo.key}.")
         return 0
+    if args.command and args.command[0] == "--":
+        args.command = args.command[1:]
     if not args.command:
         check = store.check_for(repo.key)
         print(f"receipts: check is `{check}`." if check else "receipts: no check configured.")
@@ -139,6 +159,11 @@ def cmd_check(store, repo: Repo, args) -> int:
         _say("receipts: the check must be one non-empty line.")
         return 2
     store.set_check(repo.key, command)
+    try:
+        gitstate.fingerprint(repo.root, _deadline())
+    except gitstate.GitUnavailable as exc:
+        _say(f"receipts: warning — this repository cannot earn receipts yet ({exc}). Pushes will be blocked "
+             "until that is resolved; `receipts check --off` removes the check.")
     print(f"receipts: check for {repo.key} is now `{command}`. Record a pass with `receipts run`.")
     return 0
 
@@ -155,14 +180,24 @@ def cmd_run(store, repo: Repo, args) -> int:
         return 2
     started = time.time()
     digest, size = hashlib.sha256(), 0
-    proc = subprocess.Popen(check, shell=True, cwd=repo.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # The check sees the caller's environment minus Git's own variables, which would
+    # point it at the wrong index or directory when this runs under a hook or alias.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    proc = subprocess.Popen(check, shell=True, cwd=repo.root, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
     out = sys.stdout.buffer
-    for chunk in iter(lambda: proc.stdout.read1(65536), b""):
-        out.write(chunk)
-        out.flush()
-        digest.update(chunk)
-        size += len(chunk)
-    code = proc.wait()
+    try:
+        for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+            out.write(chunk)
+            out.flush()
+            digest.update(chunk)
+            size += len(chunk)
+        code = proc.wait()
+    except KeyboardInterrupt:
+        proc.kill()
+        proc.wait()
+        _say("receipts: interrupted; no receipt recorded.")
+        return 130
     try:
         after = gitstate.fingerprint(repo.root, _deadline())
     except gitstate.GitUnavailable as exc:
@@ -330,10 +365,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     blocking = args.cmd == "hook"
     try:
-        repo = Repo.at(os.getcwd())
+        repo = Repo.for_hook() if blocking else Repo.at(os.getcwd())
         if repo is None:
             if blocking:
-                return 0                      # bare or unusual layout: nothing this gate can check
+                _say("[receipts] Blocked `git push`: cannot identify the repository being pushed from.")
+                return 1
             _say("receipts: the current directory is not inside a git repository.")
             return 2
         return handler(Store(path=db_path()), repo, args)

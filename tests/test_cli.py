@@ -136,6 +136,35 @@ class CliTest(unittest.TestCase):
             self.assertEqual(handle.read(), "#!/bin/sh\nexit 0\n")
         self.assertEqual(self.cli("uninstall-hook").returncode, 1)
 
+    def test_double_dash_is_not_part_of_the_check(self):
+        self.assertEqual(self.cli("check", "--", "sh", "check.sh").returncode, 0)
+        self.assertIn("`sh check.sh`", self.cli("check").stdout)
+
+    def test_relative_hooks_path_is_honoured_and_gates(self):
+        self.git("config", "core.hooksPath", "githooks")
+        self.assertEqual(self.cli("check", "sh", "check.sh").returncode, 0)
+        self.assertEqual(self.cli("install-hook").returncode, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.repo, "githooks", "pre-push")))
+        self.git("add", "githooks")
+        self.git("commit", "-q", "-m", "hooks")
+        self.assertNotEqual(self.push().returncode, 0)
+        self.assertEqual(self.cli("run").returncode, 0)
+        self.assertEqual(self.push().returncode, 0)
+
+    def test_push_through_git_dir_from_elsewhere_is_still_gated(self):
+        self.configure()
+        proc = subprocess.run(["git", "--git-dir", os.path.join(self.repo, ".git"), "push", "-q", "origin",
+                               "HEAD:refs/heads/main"], cwd=os.path.dirname(self.repo), env=self.env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("[receipts] Blocked", proc.stdout)
+
+    def test_unsupported_repository_warns_when_the_check_is_set(self):
+        self.git("update-index", "--assume-unchanged", "answer.txt")
+        result = self.cli("check", "sh", "check.sh")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("cannot earn receipts", result.stdout)
+
     def test_uninstall_and_check_off(self):
         self.configure()
         self.assertNotEqual(self.push().returncode, 0)

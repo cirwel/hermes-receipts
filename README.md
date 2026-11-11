@@ -81,7 +81,7 @@ single-profile mode.
 `cli.py` runs the same receipts as a plain Git tool, with no Hermes involved.
 The gate is a `pre-push` hook that Git runs itself, so it covers every tool
 that pushes from the repository: a person, Claude Code, Codex, Hermes or a
-script. It needs Git and Python 3.9+ and has no other dependencies.
+script. It needs Git 2.31+ and Python 3.9+ and has no other dependencies.
 
 ```sh
 ln -s /absolute/path/to/hermes-receipts/cli.py ~/.local/bin/receipts
@@ -113,6 +113,11 @@ Differences from the plugin:
   and is separate from the Hermes plugin's ledger.
 - Only `git push` is gated; a pull request needs a pushed branch, so `gh pr
   create` is covered that way. Deleting a remote branch is not gated.
+- Only the last commit of each pushed branch or tag is verified, as in the
+  plugin; earlier commits in the same push are not checked individually.
+- Repositories the fingerprint does not support (submodules, sparse or
+  assume-unchanged entries, external clean filters, embedded repositories)
+  cannot earn receipts. `receipts check` warns about this when you set a check.
 - A check that writes untracked, non-ignored files changes the content it is
   checking and earns no receipt. Add those files to `.gitignore`.
 - `git push --no-verify` skips the hook, as it skips every Git hook. This is a

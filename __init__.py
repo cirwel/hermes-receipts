@@ -59,9 +59,9 @@ def _inactive_reason() -> str:
             return _MULTIPLEX_UNSUPPORTED
         from hermes_cli.config import load_config
         config = load_config() or {}
-        if config.get("plugins", {}).get("isolation") == "host":
+        if (config.get("plugins") or {}).get("isolation") == "host":
             return "the separate plugin host is not supported in this release"
-        backend = config.get("terminal", {}).get("env") or os.environ.get("TERMINAL_ENV") or "local"
+        backend = (config.get("terminal") or {}).get("env") or os.environ.get("TERMINAL_ENV") or "local"
     except ImportError:
         backend = os.environ.get("TERMINAL_ENV") or "local"
     backend = backend.strip().lower()
@@ -88,9 +88,11 @@ class Receipts:
     def pre_llm_call(self, session_id: str = "", model: str = "", **_):
         """Remember which model is driving a session. Observes only; never returns a directive."""
         try:
-            if isinstance(model, str) and model.strip() and isinstance(session_id, str) and not _inactive_reason():
-                self._models.pop(session_id or "", None)
-                self._models[session_id or ""] = " ".join(model.split())[:120]
+            if not isinstance(session_id, str) or _inactive_reason():
+                return None
+            self._models.pop(session_id, None)            # a session that stops reporting a model has none
+            if isinstance(model, str) and model.strip():
+                self._models[session_id] = " ".join(model.split())[:120]
                 while len(self._models) > MAX_TRACKED_SESSIONS:
                     self._models.pop(next(iter(self._models)))
         except Exception:
@@ -100,6 +102,23 @@ class Receipts:
     # ── gate ───────────────────────────────────────────────────────────────
     def pre_tool_call(self, tool_name: str = "", args: dict | None = None, tool_call_id: str = "",
                       task_id: str = "", session_id: str = "", **_):
+        try:
+            return self._pre_tool_call(tool_name, args, tool_call_id, task_id, session_id)
+        except Exception as exc:
+            # Hermes skips a hook that raises, which would let the command through. A publishing
+            # command the gate could not evaluate is refused; everything else runs as usual.
+            command = args.get("command") if isinstance(args, dict) else ""
+            try:
+                publishing = tool_name == "terminal" and isinstance(command, str) \
+                    and bool(shell.guarded_actions(command, os.curdir))
+            except Exception:
+                publishing = True
+            if publishing:
+                return {"action": "block", "message": f"[receipts] Could not verify this command: {exc}. "
+                        "Retry it as a plain command."}
+            return None
+
+    def _pre_tool_call(self, tool_name, args, tool_call_id, task_id, session_id):
         if tool_name != "terminal":
             return None
         task_id, session_id = _text(task_id), _text(session_id)
@@ -115,8 +134,14 @@ class Receipts:
             return None
         deadline = time.monotonic() + BUDGET_S
         base = self._terminal_cwds.get(task_id or session_id) or _agent_cwd()
-        if args.get("workdir"):
-            base = os.path.join(base, os.path.expanduser(args["workdir"]))
+        workdir = args.get("workdir")
+        if workdir and not isinstance(workdir, str):
+            if shell.guarded_actions(command, base) or shell.is_receipts_config_change(command):
+                return {"action": "block", "message": "[receipts] Could not verify this command: its working "
+                        "directory is not a path. Retry it as a plain command."}
+            return None
+        if workdir:
+            base = os.path.join(base, os.path.expanduser(workdir))
         base = os.path.realpath(base)
 
         if shell.is_receipts_config_change(command):
@@ -137,11 +162,15 @@ class Receipts:
         return None
 
     def _gate(self, action, deadline: float) -> str | None:
-        root = gitstate.repo_root(action.cwd, deadline)
-        if not root:
-            return None
-        check = self.store.check_for(root)
+        root = gitstate.repo_root(action.cwd, deadline, strict=True)
+        check = self.store.check_for(root) if root else None
         if not check:
+            if action.elsewhere and self.store.configured_roots():
+                # --git-dir, GIT_DIR and unreadable paths can aim the command at a repository
+                # with a check from anywhere; where it runs says nothing about what it publishes.
+                return ("[receipts] Blocked: this command chooses its repository with --git-dir, a GIT_* "
+                        "variable or a path receipts cannot read, so the gate cannot tell which repository it "
+                        "publishes from. Run it as a plain command from inside the repository.")
             return None                       # unconfigured repositories are never blocked
         if error := _check_error(check, root):
             return f"[receipts] Blocked: {error}"
@@ -217,6 +246,7 @@ class Receipts:
     def post_tool_call(self, tool_name: str = "", tool_call_id: str = "", result=None, session_id: str = "",
                        duration_ms=None, args: dict | None = None, task_id: str = "", **_):
         task_id, session_id = _text(task_id), _text(session_id)
+        args = args if isinstance(args, dict) else {}
         if _inactive_reason():
             if tool_call_id:
                 _pending.pop(f"{session_id}\0{tool_call_id}", None)

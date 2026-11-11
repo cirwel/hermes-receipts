@@ -65,12 +65,17 @@ def git(root: str, *args: str, deadline: float, input: bytes | None = None, chec
     return proc.stdout
 
 
-def repo_root(path: str, deadline: float) -> str | None:
+def repo_root(path: str, deadline: float, strict: bool = False) -> str | None:
+    """The worktree root containing ``path``, or None when it is not in a repository.
+    With ``strict``, any other failure (timeout, ownership refusal, git missing) is raised
+    instead of being reported as "not a repository"."""
     if not path or not os.path.isdir(path):
         return None
     try:
         out = git(path, "rev-parse", "--show-toplevel", deadline=deadline)
-    except GitUnavailable:
+    except GitUnavailable as exc:
+        if strict and "not a git repository" not in str(exc).lower():
+            raise
         return None
     root = out.decode().strip()
     return os.path.realpath(root) if root else None
@@ -133,6 +138,15 @@ def _worktree_entry(root: str, rel: str, fmt: str,
                     deadline: float) -> tuple[str, str] | None | str:
     """Return (mode, oid), None (deleted), or the string "blob" when git must hash it."""
     full = os.path.join(root, rel)
+    # A path under a symlink does not exist as far as Git is concerned: the link is the entry.
+    parent = os.path.dirname(rel)
+    while parent:
+        try:
+            if not stat.S_ISDIR(os.lstat(os.path.join(root, parent)).st_mode):
+                return None
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        parent = os.path.dirname(parent)
     try:
         st = os.lstat(full)
     except (FileNotFoundError, NotADirectoryError):

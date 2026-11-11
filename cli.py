@@ -23,6 +23,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -32,6 +33,7 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 BUDGET_S = 60.0
 HOOK_MARKER = "# receipts pre-push hook"
+_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def _load(name: str):
@@ -270,17 +272,19 @@ def cmd_hook(store, repo: Repo, args) -> int:
         _say(f"receipts: unsupported hook `{args.name}`.")
         return 2
     revs: list[str] = []
-    for line in sys.stdin.read().splitlines():
-        if not line.strip():
+    # Git writes one line per ref: "<local ref> SP <local sha> SP <remote ref> SP <remote sha> LF".
+    # Only an ASCII space separates fields and only LF ends a line; ref names may contain other
+    # Unicode whitespace, so this is parsed as bytes. The local ref may be a revision expression
+    # with spaces, so fields are taken from the right. Anything else must not pass as approval.
+    for raw in sys.stdin.buffer.read().split(b"\n"):
+        if not raw:
             continue
-        # <local ref> <local sha> <remote ref> <remote sha>; the local ref may be a revision
-        # expression containing spaces, so split from the right. A line that does not fit
-        # is content this gate cannot see, which must not pass as approval.
-        parts = line.rsplit(None, 3)
-        if len(parts) != 4:
+        fields = raw.rsplit(b" ", 3)
+        shas = [f.decode("ascii", "replace") for f in fields[1::2]] if len(fields) == 4 else []
+        if len(shas) != 2 or not all(_OID.fullmatch(sha) for sha in shas):
             _say("[receipts] Blocked `git push`: could not read what is being pushed.")
             return 1
-        local_sha = parts[1]
+        local_sha = shas[0]
         if set(local_sha) == {"0"}:           # deleting a remote ref publishes no content
             continue
         if local_sha not in revs:

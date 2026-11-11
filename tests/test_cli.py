@@ -159,6 +159,29 @@ class CliTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("[receipts] Blocked", proc.stdout)
 
+    def test_checked_push_through_git_dir_from_elsewhere_is_allowed(self):
+        self.configure()
+        self.assertEqual(self.cli("run").returncode, 0)
+        proc = subprocess.run(["git", "--git-dir", os.path.join(self.repo, ".git"), "push", "-q", "origin",
+                               "HEAD:refs/heads/main"], cwd=os.path.dirname(self.repo), env=self.env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+    def test_revision_expression_with_spaces_is_still_gated(self):
+        self.configure()
+        self.assertEqual(self.cli("run").returncode, 0)
+        self.write("answer.txt", "ok, unchecked\n")
+        self.git("commit", "-q", "-am", "unchecked change")
+        blocked = self.push("HEAD^{/unchecked change}:refs/heads/main")
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+        self.assertIn("[receipts] Blocked", blocked.stdout)
+
+    def test_unreadable_hook_input_blocks(self):
+        self.configure()
+        result = self.cli("hook", "pre-push", "origin", "url", stdin="garbage line\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("[receipts] Blocked", result.stdout)
+
     def test_unsupported_repository_warns_when_the_check_is_set(self):
         self.git("update-index", "--assume-unchanged", "answer.txt")
         result = self.cli("check", "sh", "check.sh")

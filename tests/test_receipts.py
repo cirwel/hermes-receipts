@@ -179,6 +179,40 @@ class RepoCase(unittest.TestCase):
         self.assertEqual(service.pre_tool_call("terminal", push, "p2")["action"], "block")
         self.assertIn("no passing run", service.pre_tool_call("terminal", push, "p3")["message"])
 
+    def test_receipt_is_recorded_soon_after_a_deferred_upgrade(self):
+        import sqlite3
+        path = self.old_ledger("deferred.db")
+        other = sqlite3.connect(path)
+        other.execute("BEGIN IMMEDIATE")
+        self.addCleanup(other.close)
+        service = receipts.Receipts(Store(path))
+        self.write("top.txt", "new content\n")
+        args = {"command": "python3 -m unittest", "workdir": str(self.root)}
+        self.assertIsNone(service.pre_tool_call("terminal", args, "c1", session_id="s"))   # upgrade deferred here
+        other.rollback()                                                                # lock released mid-check
+        service.post_tool_call("terminal", "c1", json.dumps({"exit_code": 0, "output": "ok"}), session_id="s")
+        self.assertEqual(service._unrecorded, {})
+        row = service.store.recent(str(self.root))[0]
+        self.assertEqual((row["status"], len(receipts.field(row, "issuer"))), ("passed", 36))
+
+    def test_receipt_is_still_recorded_when_the_ledger_cannot_be_upgraded(self):
+        path = self.old_ledger("stuck.db")
+        store = Store(path)
+        with patch.object(Store, "_upgrade", lambda self, conn, force=False: None):
+            self.assertEqual(store.issuer_id(), "")
+            store.add(root="r", command="c", tree="t9", head_tree="t9", overlay={}, status="passed", exit_code=0,
+                      duration_ms=1, output_sha256="h", output_chars=1, session_id="s", model="m", issuer="")
+            self.assertEqual(store.latest_for_tree("r", "t9", "c")["status"], "passed")
+
+    def test_non_string_ids_never_raise_in_tool_hooks(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        args = {"command": "python3 -m unittest", "workdir": str(self.root)}
+        self.assertIsNone(self.service.pre_tool_call("terminal", args, "c", task_id="", session_id={"a": 1}))
+        self.service.post_tool_call("terminal", "c", json.dumps({"exit_code": 0, "output": "ok", "cwd": str(self.root)}),
+                                    session_id={"a": 1}, task_id=["x"])
+        self.assertEqual(self.service._unrecorded, {})
+        self.assertEqual(self.store.recent(str(self.root))[0]["status"], "passed")
+
     def test_ledger_locked_by_another_writer_does_not_stall_or_block_the_gate(self):
         import sqlite3
         path = self.old_ledger("locked.db")

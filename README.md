@@ -76,6 +76,56 @@ Previously saved unsupported checks show repair guidance in `/receipts` and
 the push-block message. Unconfigured repositories are unaffected in supported
 single-profile mode.
 
+## Without Hermes: a Git pre-push hook
+
+`cli.py` runs the same receipts as a plain Git tool, with no Hermes involved.
+The gate is a `pre-push` hook that Git runs itself, so it covers every tool
+that pushes from the repository: a person, Claude Code, Codex, Hermes or a
+script. It needs Git 2.31+ and Python 3.9+ and has no other dependencies.
+
+```sh
+ln -s /absolute/path/to/hermes-receipts/cli.py ~/.local/bin/receipts
+cd your-repository
+receipts check python3 -m unittest discover -s tests
+receipts install-hook
+receipts run          # runs the check here and records the result for this content
+git push              # allowed only when the pushed commit's content has a pass
+```
+
+| Command | Result |
+| --- | --- |
+| `receipts check <command>` | Set the check (`--off` removes it; no arguments shows it) |
+| `receipts run [--actor <text>]` | Run the check in this worktree and record a receipt |
+| `receipts status` | The check, the receipt for the current content, and the hook |
+| `receipts verify [rev ...]` | Exit 0 when each commit (default `HEAD`) has a passing receipt |
+| `receipts log` | Recent receipts, with the actor when one was given |
+| `receipts install-hook` / `uninstall-hook` | Add or remove the `pre-push` hook |
+
+Differences from the plugin:
+
+- The tool runs the check itself, so any one-line shell command is accepted.
+- The check and its receipts belong to the repository, not to one directory:
+  every worktree shares them, and a pass earned in one worktree counts for the
+  same content in another.
+- `--actor` (or `$RECEIPTS_ACTOR`) stores free text with the receipt, such as a
+  model name and an agent id. It is a self-reported label, not proof.
+- The ledger is `$RECEIPTS_DB`, by default `~/.local/state/receipts/receipts.db`,
+  and is separate from the Hermes plugin's ledger.
+- Only `git push` is gated; a pull request needs a pushed branch, so `gh pr
+  create` is covered that way. Deleting a remote branch is not gated.
+- Only the last commit of each pushed branch or tag is verified, as in the
+  plugin; earlier commits in the same push are not checked individually.
+- Repositories the fingerprint does not support (submodules, sparse or
+  assume-unchanged entries, external clean filters, embedded repositories)
+  cannot earn receipts. `receipts check` warns about this when you set a check.
+- A check that writes untracked, non-ignored files changes the content it is
+  checking and earns no receipt. Add those files to `.gitignore`.
+- `git push --no-verify` skips the hook, as it skips every Git hook. This is a
+  guard against forgetting, not against someone who intends to bypass it.
+- `install-hook` will not overwrite an existing `pre-push` hook it did not
+  write; it prints the line to add to yours. The hook records the tool's
+  location and blocks with an explanation if the tool is later moved.
+
 ## What is verified
 
 Each receipt binds the configured command and its exit status to a Git tree ID.

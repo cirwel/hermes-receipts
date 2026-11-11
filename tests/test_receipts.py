@@ -91,6 +91,144 @@ class RepoCase(unittest.TestCase):
         self.assertIsNone(self.pre(command))
         self.service.post_tool_call("terminal", "call", json.dumps({"exit_code": code, "output": "test result"}))
 
+    # ── provenance ─────────────────────────────────────────────────────────
+    def checked(self, session="s1", call="c1", code=0, between=None):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        args = {"command": "python3 -m unittest", "workdir": str(self.root)}
+        self.assertIsNone(self.service.pre_tool_call("terminal", args, call, session_id=session))
+        if between:
+            between()
+        self.service.post_tool_call("terminal", call, json.dumps({"exit_code": code, "output": "ok"}),
+                                    session_id=session)
+        return self.store.recent(str(self.root))[0]
+
+    def test_receipt_records_the_model_driving_the_session_and_the_issuer(self):
+        self.assertIsNone(self.service.pre_llm_call(session_id="s1", model="hermes-test-model"))
+        self.assertIsNone(self.service.pre_llm_call(session_id="other", model="someone-else"))
+        row = self.checked()
+        self.assertEqual((row["status"], row["model"], row["session_id"]), ("passed", "hermes-test-model", "s1"))
+        self.assertEqual(row["issuer"], self.store.issuer_id())
+        self.assertEqual(Store(self.store.path).issuer_id(), row["issuer"])      # minted once, then stable
+        self.assertEqual(len(row["issuer"]), 36)
+
+    def test_model_is_the_one_that_started_the_check(self):
+        self.service.pre_llm_call(session_id="s1", model="model-a")
+        row = self.checked(between=lambda: self.service.pre_llm_call(session_id="s1", model="model-b"))
+        self.assertEqual(row["model"], "model-a")
+
+    def test_unknown_model_is_recorded_as_empty_never_guessed(self):
+        for bad in (None, 7, "", "   "):
+            self.assertIsNone(self.service.pre_llm_call(session_id="s1", model=bad))
+        self.assertEqual(self.checked()["model"], "")
+        with patch.object(receipts, "_inactive_reason", return_value=receipts._MULTIPLEX_UNSUPPORTED):
+            self.service.pre_llm_call(session_id="s2", model="multiplexed-model")
+        self.assertEqual(self.service._models, {})
+
+    def test_tracked_sessions_are_bounded(self):
+        for i in range(receipts.MAX_TRACKED_SESSIONS + 20):
+            self.service.pre_llm_call(session_id=f"s{i}", model="m")
+        self.assertEqual(len(self.service._models), receipts.MAX_TRACKED_SESSIONS)
+        self.assertIn(f"s{receipts.MAX_TRACKED_SESSIONS + 19}", self.service._models)
+        oldest = next(iter(self.service._models))
+        self.service.pre_llm_call(session_id=oldest, model="m2")          # seen again: no longer first out
+        self.service.pre_llm_call(session_id="one-more", model="m")
+        self.assertEqual(self.service._models[oldest], "m2")
+
+    def test_odd_session_ids_never_raise(self):
+        self.store.set_check(str(self.root), "python3 -m unittest")
+        args = {"command": "python3 -m unittest", "workdir": str(self.root)}
+        self.assertIsNone(self.service.pre_llm_call(session_id={"a": 1}, model="m"))
+        self.assertIsNone(self.service.pre_tool_call("terminal", args, "c", task_id="t", session_id={"a": 1}))
+
+    def old_ledger(self, name="old.db"):
+        import sqlite3
+        path = Path(self.tmp.name) / name
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE checks (root TEXT PRIMARY KEY, command TEXT NOT NULL, set_at REAL NOT NULL)""")
+        conn.execute("""CREATE TABLE receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+            root TEXT NOT NULL, command TEXT NOT NULL, tree TEXT NOT NULL, head_tree TEXT NOT NULL,
+            overlay_json TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, duration_ms INTEGER,
+            output_sha256 TEXT NOT NULL, output_chars INTEGER NOT NULL, session_id TEXT NOT NULL)""")
+        conn.execute("CREATE INDEX receipts_root_tree ON receipts (root, tree, id)")
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        conn.execute("INSERT INTO checks VALUES (?, 'python3 -m unittest', 1)", (str(self.root),))
+        conn.execute("INSERT INTO receipts (created_at, root, command, tree, head_tree, overlay_json, status,"
+                     " exit_code, duration_ms, output_sha256, output_chars, session_id)"
+                     " VALUES (1, ?, 'python3 -m unittest', ?, ?, '{}', 'passed', 0, 1, 'h', 1, '')",
+                     (str(self.root), tree, tree))
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_unwritable_0_1_ledger_still_gates_exactly_as_before(self):
+        path = self.old_ledger()
+        os.chmod(path, 0o444)
+        os.chmod(path.parent, 0o555)
+        self.addCleanup(os.chmod, path.parent, 0o755)
+        service = receipts.Receipts(Store(path))
+        push = {"command": "git push origin main", "workdir": str(self.root)}
+        self.assertIsNone(service.pre_tool_call("terminal", push, "p1"))           # the old pass still counts
+        with patch.object(receipts, "_agent_cwd", return_value=str(self.root)):
+            status = service.command()
+            self.assertIn("receipt: PASSED", status)
+            self.assertIn("model not recorded · issuer not recorded", status)
+            self.assertIn("model:    not recorded", service.command("show"))
+            self.assertIn("passed", service.command("log"))
+        self.write("top.txt", "changed\n")
+        self.commit()
+        self.assertEqual(service.pre_tool_call("terminal", push, "p2")["action"], "block")
+        self.assertIn("no passing run", service.pre_tool_call("terminal", push, "p3")["message"])
+
+    def test_ledger_locked_by_another_writer_does_not_stall_or_block_the_gate(self):
+        import sqlite3
+        path = self.old_ledger("locked.db")
+        other = sqlite3.connect(path)
+        other.execute("BEGIN IMMEDIATE")
+        self.addCleanup(other.close)
+        service = receipts.Receipts(Store(path))
+        started = time.monotonic()
+        self.assertIsNone(service.pre_tool_call("terminal", {"command": "git push origin main",
+                                                             "workdir": str(self.root)}, "p1"))
+        self.assertLess(time.monotonic() - started, 3)
+        other.rollback()
+        service.store._upgrade_after = 0.0
+        self.assertEqual(len(service.store.issuer_id()), 36)                       # upgraded once writable
+
+    def test_show_and_status_name_who_checked(self):
+        self.service.pre_llm_call(session_id="s1", model="hermes-test-model")
+        row = self.checked()
+        with patch.object(receipts, "_agent_cwd", return_value=str(self.root)):
+            shown = self.service.command("show")
+            self.assertIn(f"Receipt #{row['id']} — passed", shown)
+            self.assertIn("model:    hermes-test-model", shown)
+            self.assertIn("issuer:   " + row["issuer"], shown)
+            self.assertIn("tree " + self.git("rev-parse", "HEAD^{tree}"), shown)
+            self.assertIn("Not a signature", shown)
+            self.assertEqual(self.service.command(f"show #{row['id']}"), shown)
+            self.assertIn("no receipt #999", self.service.command("show 999"))
+            self.assertIn("checked by: model hermes-test-model · issuer " + row["issuer"][:8], self.service.command())
+            self.assertIn("model hermes-test-model", self.service.command("log"))
+
+    def test_ledger_from_0_1_gains_the_new_columns_in_place(self):
+        import sqlite3
+        path = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+            root TEXT NOT NULL, command TEXT NOT NULL, tree TEXT NOT NULL, head_tree TEXT NOT NULL,
+            overlay_json TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, duration_ms INTEGER,
+            output_sha256 TEXT NOT NULL, output_chars INTEGER NOT NULL, session_id TEXT NOT NULL)""")
+        conn.execute("INSERT INTO receipts (created_at, root, command, tree, head_tree, overlay_json, status,"
+                     " exit_code, duration_ms, output_sha256, output_chars, session_id)"
+                     " VALUES (1, 'r', 'c', 't', 't', '{}', 'passed', 0, 1, 'h', 1, '')")
+        conn.commit()
+        conn.close()
+        store = Store(path)
+        self.assertEqual(store.latest_for_tree("r", "t", "c")["model"], "")
+        self.assertEqual(store.issuer_id(), Store(path).issuer_id())
+        store.add(root="r", command="c", tree="t2", head_tree="t2", overlay={}, status="passed", exit_code=0,
+                  duration_ms=1, output_sha256="h", output_chars=1, session_id="s", model="m", issuer="i")
+        self.assertEqual(store.latest_for_tree("r", "t2", "c")["model"], "m")
+
     def test_commit_resolution(self):
         self.assertEqual(gitstate.commit_tree(str(self.root), "HEAD", time.monotonic() + 5),
                          (self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")))
